@@ -6035,18 +6035,38 @@ async fn handle_forward_proxy(
         let force_deny = hard_deny_reason.is_some();
         let (allowed, reason) = hard_deny_reason.map_or_else(
             || {
-                crate::l7::relay::evaluate_l7_request(&tunnel_engine, &l7_ctx, &request_info)
-                    .unwrap_or_else(|e| {
-                        let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                            .activity(ActivityId::Fail)
-                            .severity(SeverityId::Low)
-                            .status(StatusId::Failure)
-                            .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                            .message(format!("L7 eval failed, denying request: {e}"))
-                            .build();
-                        ocsf_emit!(event);
-                        (false, format!("L7 evaluation error: {e}"))
+                let evaluation = if l7_config.config.protocol == crate::l7::L7Protocol::Rest
+                    && tunnel_engine.http_hitl_classification_enabled()
+                {
+                    crate::l7::rest::request_from_buffered_http(
+                        request_info.action.clone(),
+                        path.clone(),
+                        &path,
+                        forward_request_bytes.clone(),
+                    )
+                    .and_then(|request| {
+                        crate::l7::hitl::evaluate_http_l7_request(
+                            &tunnel_engine,
+                            &l7_ctx,
+                            &l7_config.config,
+                            &request,
+                            &request_info,
+                        )
                     })
+                } else {
+                    crate::l7::relay::evaluate_l7_request(&tunnel_engine, &l7_ctx, &request_info)
+                };
+                evaluation.unwrap_or_else(|e| {
+                    let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                        .activity(ActivityId::Fail)
+                        .severity(SeverityId::Low)
+                        .status(StatusId::Failure)
+                        .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+                        .message(format!("L7 eval failed, denying request: {e}"))
+                        .build();
+                    ocsf_emit!(event);
+                    (false, format!("L7 evaluation error: {e}"))
+                })
             },
             |reason| (false, reason),
         );

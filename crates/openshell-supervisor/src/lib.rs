@@ -2739,6 +2739,7 @@ async fn load_policy_with_gateway(
         } else {
             MiddlewareRegistryStatus::Synchronized
         };
+            config_runtime::apply_http_hitl_classification_setting(&engine, &snapshot.settings);
             let opa_engine = Some(engine);
 
             // The gateway compares the entire tuple again. A concurrent repair or

@@ -690,6 +690,7 @@ impl ConfigRuntime {
         // Apply OCSF JSON toggle from the `ocsf_json_enabled` setting.
         apply_ocsf_json_setting(&ctx.ocsf_enabled, &result.settings);
         apply_ocsf_schema_version_setting(&ctx.ocsf_schema_version, &result.settings);
+        apply_http_hitl_classification_setting(&ctx.opa_engine, &result.settings);
 
         // Apply the agent-proposals feature toggle. On a false→true transition
         // we lazily install the skill so a sandbox that started with the flag
@@ -1278,6 +1279,7 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                     }
                     apply_ocsf_json_setting(&ctx.ocsf_enabled, &result.settings);
                     apply_ocsf_schema_version_setting(&ctx.ocsf_schema_version, &result.settings);
+                    apply_http_hitl_classification_setting(&ctx.opa_engine, &result.settings);
                     apply_agent_proposals_enabled(
                         &ctx.agent_proposals,
                         agent_proposals_enabled_from_settings(&result.settings),
@@ -1317,6 +1319,7 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                 (InitialPollDisposition::TrackOnly, _) => {
                     apply_ocsf_json_setting(&ctx.ocsf_enabled, &result.settings);
                     apply_ocsf_schema_version_setting(&ctx.ocsf_schema_version, &result.settings);
+                    apply_http_hitl_classification_setting(&ctx.opa_engine, &result.settings);
                     apply_agent_proposals_enabled(
                         &ctx.agent_proposals,
                         agent_proposals_enabled_from_settings(&result.settings),
@@ -1495,6 +1498,19 @@ fn extract_string_setting(
             setting_value::Value::StringValue(value) => Some(value.clone()),
             _ => None,
         })
+}
+
+pub fn apply_http_hitl_classification_setting(
+    engine: &openshell_supervisor_network::opa::OpaEngine,
+    settings: &std::collections::HashMap<String, openshell_core::proto::EffectiveSetting>,
+) {
+    engine.set_http_hitl_classification_enabled(
+        extract_bool_setting(
+            settings,
+            openshell_core::settings::HTTP_HITL_CLASSIFICATION_ENABLED_KEY,
+        )
+        .unwrap_or(false),
+    );
 }
 
 pub fn agent_proposals_enabled_from_settings(
@@ -1732,6 +1748,40 @@ mod tests {
         );
 
         assert!(agent_proposals_enabled_from_settings(&settings));
+    }
+
+    #[test]
+    fn http_hitl_classification_setting_is_independent_and_fail_closed() {
+        let engine = OpaEngine::from_strings(
+            "package openshell.sandbox\nallow_request := false\n",
+            "network_policies: {}\n",
+        )
+        .unwrap();
+        let key = openshell_core::settings::HTTP_HITL_CLASSIFICATION_ENABLED_KEY.to_string();
+        let mut settings = std::collections::HashMap::new();
+        apply_http_hitl_classification_setting(&engine, &settings);
+        assert!(!engine.http_hitl_classification_enabled());
+        settings.insert(key.clone(), effective_bool(true));
+        apply_http_hitl_classification_setting(&engine, &settings);
+        assert!(engine.http_hitl_classification_enabled());
+        assert!(!agent_proposals_enabled_from_settings(&settings));
+        settings.insert(
+            key,
+            openshell_core::proto::EffectiveSetting {
+                value: Some(openshell_core::proto::SettingValue {
+                    value: Some(openshell_core::proto::setting_value::Value::StringValue(
+                        "true".into(),
+                    )),
+                }),
+                scope: openshell_core::proto::SettingScope::Sandbox.into(),
+            },
+        );
+        apply_http_hitl_classification_setting(&engine, &settings);
+        assert!(!engine.http_hitl_classification_enabled());
+        engine.set_http_hitl_classification_enabled(true);
+        settings.clear();
+        apply_http_hitl_classification_setting(&engine, &settings);
+        assert!(!engine.http_hitl_classification_enabled());
     }
 
     #[test]

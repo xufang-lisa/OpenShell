@@ -9,6 +9,7 @@
 //! evaluated against OPA policy, and either forwarded or denied.
 
 pub mod graphql;
+pub mod hitl;
 pub(crate) mod http;
 pub mod jsonrpc;
 pub(crate) mod mcp;
@@ -300,6 +301,9 @@ pub struct L7Decision {
     pub allowed: bool,
     pub reason: String,
     pub matched_rule: Option<String>,
+    pub kind: hitl::L7DecisionKind,
+    pub l4_allowed: bool,
+    pub binary_identity_required: bool,
 }
 
 /// Parsed L7 request metadata used for policy evaluation and logging.

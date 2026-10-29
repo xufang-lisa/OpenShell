@@ -27,7 +27,7 @@ use openshell_supervisor_middleware::{ChainEntry, ChainRunner, MiddlewareRegistr
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex, RwLock,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use tokio::sync::watch;
 use tracing::info;
@@ -178,6 +178,7 @@ pub struct SandboxConfig {
 pub struct OpaEngine {
     engine: Mutex<regorus::Engine>,
     binary_identity_required: bool,
+    http_hitl_classification_enabled: Arc<AtomicBool>,
     generation: Arc<AtomicU64>,
     middleware_runner: RwLock<ChainRunner>,
     websocket_assembly_budget: crate::l7::websocket::WebSocketAssemblyBudget,
@@ -254,11 +255,17 @@ impl PolicyGenerationGuard {
 pub struct TunnelPolicyEngine {
     engine: Mutex<regorus::Engine>,
     generation_guard: PolicyGenerationGuard,
+    http_hitl_classification_enabled: Arc<AtomicBool>,
     middleware_runner: ChainRunner,
     websocket_assembly_budget: crate::l7::websocket::WebSocketAssemblyBudget,
 }
 
 impl TunnelPolicyEngine {
+    pub(crate) fn http_hitl_classification_enabled(&self) -> bool {
+        self.http_hitl_classification_enabled
+            .load(Ordering::Acquire)
+    }
+
     pub fn captured_generation(&self) -> u64 {
         self.generation_guard.captured_generation()
     }
@@ -300,6 +307,17 @@ impl TunnelPolicyEngine {
 }
 
 impl OpaEngine {
+    pub fn http_hitl_classification_enabled(&self) -> bool {
+        self.http_hitl_classification_enabled
+            .load(Ordering::Acquire)
+    }
+
+    /// Toggle classification only; this never enables a forwarding/hold path.
+    pub fn set_http_hitl_classification_enabled(&self, enabled: bool) {
+        self.http_hitl_classification_enabled
+            .store(enabled, Ordering::Release);
+    }
+
     pub(crate) fn websocket_assembly_budget(
         &self,
     ) -> crate::l7::websocket::WebSocketAssemblyBudget {
@@ -312,6 +330,7 @@ impl OpaEngine {
         Self {
             engine: Mutex::new(engine),
             binary_identity_required,
+            http_hitl_classification_enabled: Arc::new(AtomicBool::new(false)),
             generation,
             middleware_runner: RwLock::new(ChainRunner::default()),
             websocket_assembly_budget: crate::l7::websocket::WebSocketAssemblyBudget::default(),
@@ -1130,6 +1149,7 @@ impl OpaEngine {
         }
         Ok(TunnelPolicyEngine {
             engine: Mutex::new(engine.clone()),
+            http_hitl_classification_enabled: self.http_hitl_classification_enabled.clone(),
             generation_guard: PolicyGenerationGuard {
                 captured_generation: generation,
                 current_generation: Arc::clone(&self.generation),

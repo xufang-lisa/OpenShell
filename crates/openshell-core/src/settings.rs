@@ -84,6 +84,10 @@ impl RegisteredSetting {
 /// still applies when this flag is on.
 pub const AGENT_POLICY_PROPOSALS_ENABLED_KEY: &str = "agent_policy_proposals_enabled";
 
+/// Default-off REST HITL classification/observation only. Enabling this does
+/// not hold requests, submit proposals, grant authority, or forward denials.
+pub const HTTP_HITL_CLASSIFICATION_ENABLED_KEY: &str = "http_hitl_classification_enabled";
+
 /// Approval mode for agent-authored policy proposals.
 ///
 /// `"manual"` (the default when unset): every proposal lands in the draft
@@ -138,6 +142,11 @@ pub const REGISTERED_SETTINGS: &[RegisteredSetting] = &[
         kind: SettingValueKind::Bool,
         allowed_string_values: None,
     },
+    RegisteredSetting {
+        key: HTTP_HITL_CLASSIFICATION_ENABLED_KEY,
+        kind: SettingValueKind::Bool,
+        allowed_string_values: None,
+    },
     // Approval mode for agent-authored proposals. See
     // PROPOSAL_APPROVAL_MODE_KEY for details. Defaults to manual.
     RegisteredSetting {
@@ -184,6 +193,13 @@ mod tests {
     #[test]
     fn setting_for_key_returns_none_for_unknown() {
         assert!(setting_for_key("nonexistent_key").is_none());
+    }
+
+    #[test]
+    fn http_hitl_classification_is_a_registered_boolean_setting() {
+        let setting = setting_for_key(super::HTTP_HITL_CLASSIFICATION_ENABLED_KEY).unwrap();
+        assert_eq!(setting.kind, SettingValueKind::Bool);
+        assert!(setting.allowed_string_values.is_none());
     }
 
     #[test]

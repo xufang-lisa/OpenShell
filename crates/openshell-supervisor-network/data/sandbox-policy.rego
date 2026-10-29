@@ -513,6 +513,63 @@ request_deny_reason := reason if {
 	reason := sprintf("%s %s not permitted by policy", [input.request.method, input.request.path])
 }
 
+# --- Typed REST decision facts ---
+# Classification is derived from the same endpoint/binary and method/path
+# matchers as native authorization, never from request_deny_reason text.
+# A matching method/path whose query restrictions fail is NOT a missing rule.
+default _rest_request_endpoint := false
+
+_rest_request_endpoint := true if {
+	not is_object(object.get(input.request, "graphql", null))
+	not is_object(object.get(input.request, "jsonrpc", null))
+	some name
+	policy := data.network_policies[name]
+	binary_allowed(policy, input.exec)
+	ep := policy.endpoints[_]
+	ep.protocol == "rest"
+	endpoint_matches_l7_request(ep, input.network, input.request)
+}
+
+default _rest_request_shape_matched := false
+
+_rest_request_shape_matched := true if {
+	some name
+	policy := data.network_policies[name]
+	binary_allowed(policy, input.exec)
+	ep := policy.endpoints[_]
+	# Native REST-style rules may also live on overlapping WebSocket endpoints.
+	# Do not call a sibling query restriction failure a missing REST allow.
+	not jsonrpc_family_endpoint(ep)
+	endpoint_matches_l7_request(ep, input.network, input.request)
+	rule := ep.rules[_]
+	rule.allow.method
+	method_matches(input.request.method, rule.allow.method)
+	path_matches(input.request.path, rule.allow.path)
+}
+
+default _request_authorization_reason := "request denied by policy"
+
+_request_authorization_reason := "" if {
+	allow_request
+}
+
+_request_authorization_reason := reason if {
+	not allow_request
+	reason := request_deny_reason
+}
+
+# One query, one engine lock, one input and policy generation. Keep the
+# human-readable diagnostic for existing responses, separate from typed facts.
+request_authorization := {
+	"allowed": allow_request,
+	"l4_allowed": allow_network,
+	"binary_identity_required": binary_identity_required,
+	"explicit_deny": deny_request,
+	"rest_endpoint": _rest_request_endpoint,
+	"rest_shape_matched": _rest_request_shape_matched,
+	"reason": _request_authorization_reason,
+}
+
 # --- L7 rule matching: REST method + path ---
 
 request_allowed_for_endpoint(request, endpoint) if {

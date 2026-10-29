@@ -236,7 +236,7 @@ pub(crate) async fn prepare_inspected_request(
     Ok((req, scoped))
 }
 
-fn request_authority_matches_endpoint(
+pub(crate) fn request_authority_matches_endpoint(
     request: &crate::l7::provider::L7Request,
     ctx: &L7EvalContext,
 ) -> bool {
@@ -1397,7 +1397,7 @@ where
         let (allowed, reason) = if let Some(reason) = hard_deny_reason {
             (false, reason)
         } else {
-            evaluate_l7_request(&engine, ctx, &request_info)?
+            crate::l7::hitl::evaluate_http_l7_request(&engine, ctx, config, &req, &request_info)?
         };
 
         if close_if_stale(engine.generation_guard(), ctx) {
@@ -2111,7 +2111,8 @@ where
         }
 
         // Evaluate L7 policy via Rego (using redacted target)
-        let (allowed, reason) = evaluate_l7_request(engine, ctx, &request_info)?;
+        let (allowed, reason) =
+            crate::l7::hitl::evaluate_http_l7_request(engine, ctx, config, &req, &request_info)?;
 
         if close_if_stale(engine.generation_guard(), ctx) {
             return Ok(());
@@ -3437,7 +3438,10 @@ fn admitted_token_grant_owners_once(
         .collect()
 }
 
-fn l7_request_policy_input(ctx: &L7EvalContext, request: &L7RequestInfo) -> serde_json::Value {
+pub(crate) fn l7_request_policy_input(
+    ctx: &L7EvalContext,
+    request: &L7RequestInfo,
+) -> serde_json::Value {
     serde_json::json!({
         "network": { "host": ctx.host, "port": ctx.port },
         "exec": {

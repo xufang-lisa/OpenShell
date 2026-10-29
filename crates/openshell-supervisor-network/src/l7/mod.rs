@@ -18,6 +18,7 @@ pub mod path;
 pub mod provider;
 pub mod relay;
 pub mod rest;
+pub mod session;
 pub mod tls;
 pub(crate) mod token_grant_injection;
 pub(crate) mod websocket;

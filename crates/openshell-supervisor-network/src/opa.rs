@@ -213,6 +213,12 @@ pub struct PolicyGenerationGuard {
 }
 
 impl PolicyGenerationGuard {
+    /// Generation numbers alone do not identify the originating policy engine.
+    pub(crate) fn same_snapshot(&self, other: &Self) -> bool {
+        self.captured_generation == other.captured_generation
+            && Arc::ptr_eq(&self.current_generation, &other.current_generation)
+    }
+
     pub fn captured_generation(&self) -> u64 {
         self.captured_generation
     }

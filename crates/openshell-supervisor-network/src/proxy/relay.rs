@@ -239,14 +239,17 @@ where
     C: AsyncRead + AsyncWrite + Unpin + Send,
     U: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    // The generation-local future may be dropped by select!. Keep the exact
+    // client TCP/TLS object, reader and capture slot outside that future.
+    let mut session = crate::l7::session::HttpSession::new(client);
     match context.policy {
         PreparedHttpPolicy::Inspect { configs, evaluator } if configs.len() == 1 => {
             let generation_guard = evaluator.generation_guard().clone();
             tokio::select! {
-                result = crate::l7::relay::relay_with_inspection(
+                result = crate::l7::relay::relay_with_inspection_in_session(
                     &configs[0],
                     *evaluator,
-                    client,
+                    &mut session,
                     upstream,
                     context.request,
                 ) => result,
@@ -259,10 +262,10 @@ where
         PreparedHttpPolicy::Inspect { configs, evaluator } => {
             let generation_guard = evaluator.generation_guard().clone();
             tokio::select! {
-                result = crate::l7::relay::relay_with_route_selection(
+                result = crate::l7::relay::relay_with_route_selection_in_session(
                     &configs,
                     *evaluator,
-                    client,
+                    &mut session,
                     upstream,
                     context.request,
                 ) => result,
@@ -273,6 +276,7 @@ where
             }
         }
         PreparedHttpPolicy::Passthrough { generation_guard } => {
+            let (client, _) = session.parts();
             tokio::select! {
                 result = crate::l7::relay::relay_passthrough_with_credentials(
                     client,

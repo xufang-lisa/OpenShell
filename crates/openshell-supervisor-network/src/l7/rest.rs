@@ -115,6 +115,61 @@ impl RestProvider {
             canonicalize_options,
         }
     }
+
+    /// Capture into an outer-owned slot before returning a parsed request.
+    /// Dropping this borrowed future loses neither consumed header bytes nor
+    /// the frozen request. Re-entry returns the same request, not the next one.
+    pub async fn capture_request<C: AsyncRead + Unpin>(
+        &self,
+        client: &mut tokio::io::BufReader<C>,
+        slot: &mut super::session::RequestSlot,
+    ) -> Result<Option<L7Request>> {
+        self.capture_request_for_classification(client, slot, true)
+            .await
+    }
+
+    /// The observation switch selects snapshot overhead, never approval/hold.
+    /// Both paths keep partial bytes in the outer slot across cancellation.
+    /// Without observation, move the completed header directly to the parser.
+    pub(crate) async fn capture_request_for_classification<C: AsyncRead + Unpin>(
+        &self,
+        client: &mut tokio::io::BufReader<C>,
+        slot: &mut super::session::RequestSlot,
+        classification_enabled: bool,
+    ) -> Result<Option<L7Request>> {
+        if let Some(frozen) = slot.frozen() {
+            // Fresh endpoint options may be stricter after a policy reload.
+            // Revalidate original bytes without reading or replacing Q.
+            let checked = parse_http_request_header(
+                frozen.captured_header().to_vec(),
+                self.canonicalize_options,
+            )?;
+            if &checked != frozen.request() {
+                return Err(miette!(
+                    "native canonicalization changed for frozen request"
+                ));
+            }
+            return Ok(Some(frozen.request().clone()));
+        }
+        let capture = slot.capture_buffer()?;
+        if !capture_http_header(client, capture).await? {
+            return Ok(None);
+        }
+        if !classification_enabled {
+            // Synchronous transfer + parse: no cancellation gap after the
+            // header leaves the slot, and no extra raw/canonical snapshot.
+            return parse_http_request_header(
+                slot.take_unretained_header()?,
+                self.canonicalize_options,
+            )
+            .map(Some);
+        }
+        let request = parse_http_request_header(capture.clone(), self.canonicalize_options)?;
+        // No await between parsing, freeze and return: the owner has Q before
+        // any route lookup, classification or other generation-local work.
+        slot.freeze(request.clone(), client.buffer().len())?;
+        Ok(Some(request))
+    }
 }
 
 impl L7Provider for RestProvider {
@@ -199,8 +254,19 @@ async fn parse_http_request<C: AsyncRead + Unpin>(
     canonicalize_options: &crate::l7::path::CanonicalizeOptions,
 ) -> Result<Option<L7Request>> {
     let mut buf = Vec::with_capacity(4096);
+    if !capture_http_header(client, &mut buf).await? {
+        return Ok(None);
+    }
+    parse_http_request_header(buf, *canonicalize_options).map(Some)
+}
 
-    loop {
+/// Byte reads and the capture buffer both remain cancellation-safe. A retry
+/// must use the same buffer and original reader, never replay a consumed prefix.
+async fn capture_http_header<C: AsyncRead + Unpin>(
+    client: &mut C,
+    buf: &mut Vec<u8>,
+) -> Result<bool> {
+    while !buf.ends_with(b"\r\n\r\n") {
         if buf.len() > MAX_HEADER_BYTES {
             return Err(miette!(
                 "HTTP request headers exceed {MAX_HEADER_BYTES} bytes"
@@ -209,21 +275,21 @@ async fn parse_http_request<C: AsyncRead + Unpin>(
 
         let byte = match client.read_u8().await {
             Ok(b) => b,
-            Err(e) if buf.is_empty() && is_benign_close(&e) => return Ok(None),
+            Err(e) if buf.is_empty() && is_benign_close(&e) => return Ok(false),
             Err(e) if buf.is_empty() && e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                return Ok(None); // Clean close before any data
+                return Ok(false); // Clean close before any data
             }
             Err(e) => return Err(miette::miette!("{e}")),
         };
         buf.push(byte);
-
-        // Check for end of headers -- `ends_with` is sufficient because
-        // we append exactly one byte per iteration.
-        if buf.ends_with(b"\r\n\r\n") {
-            break;
-        }
     }
+    Ok(true)
+}
 
+fn parse_http_request_header(
+    mut buf: Vec<u8>,
+    canonicalize_options: crate::l7::path::CanonicalizeOptions,
+) -> Result<L7Request> {
     // Parse request line
     let header_end = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
 
@@ -283,7 +349,7 @@ async fn parse_http_request<C: AsyncRead + Unpin>(
     // with how duplicate Content-Length, bare LF, and invalid UTF-8 are
     // handled by this parser.
     let (canonical, raw_query) =
-        crate::l7::path::canonicalize_request_target(&target, canonicalize_options)
+        crate::l7::path::canonicalize_request_target(&target, &canonicalize_options)
             .map_err(|e| miette!("HTTP request-target rejected: {e}"))?;
 
     let query_params = match raw_query.as_deref() {
@@ -301,13 +367,13 @@ async fn parse_http_request<C: AsyncRead + Unpin>(
         )?;
     }
 
-    Ok(Some(L7Request {
+    Ok(L7Request {
         action: method,
         target: canonical.path,
         query_params,
         raw_header: buf, // exact header bytes up to and including \r\n\r\n
         body_length,
-    }))
+    })
 }
 
 /// Build an L7 request from a request already buffered by another proxy path.

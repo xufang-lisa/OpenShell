@@ -267,6 +267,7 @@ pub(crate) fn assess_rest_hitl_candidate(
 /// Shared HTTP seam for dedicated REST, route-selected HTTP and FORWARD. The
 /// default-off path calls the native evaluator unchanged. Opt-in changes only
 /// classification/observability; the caller retains its existing allow/deny.
+#[cfg(test)]
 pub(crate) fn evaluate_http_l7_request(
     engine: &TunnelPolicyEngine,
     ctx: &L7EvalContext,
@@ -274,7 +275,36 @@ pub(crate) fn evaluate_http_l7_request(
     request: &L7Request,
     info: &L7RequestInfo,
 ) -> Result<(bool, String)> {
+    evaluate_http_l7_request_observed(engine, ctx, config, request, info, None)
+}
+
+/// Bind observations to the outer-owned frozen request, never just a bool.
+pub(crate) fn evaluate_http_l7_request_with_slot(
+    engine: &TunnelPolicyEngine,
+    ctx: &L7EvalContext,
+    config: &L7EndpointConfig,
+    request: &L7Request,
+    info: &L7RequestInfo,
+    slot: &mut super::session::RequestSlot,
+) -> Result<(bool, String)> {
+    evaluate_http_l7_request_observed(engine, ctx, config, request, info, Some(slot))
+}
+
+fn evaluate_http_l7_request_observed(
+    engine: &TunnelPolicyEngine,
+    ctx: &L7EvalContext,
+    config: &L7EndpointConfig,
+    request: &L7Request,
+    info: &L7RequestInfo,
+    mut slot: Option<&mut super::session::RequestSlot>,
+) -> Result<(bool, String)> {
+    if let Some(slot) = slot.as_deref_mut() {
+        slot.invalidate_classification();
+    }
     if config.protocol != L7Protocol::Rest || !engine.http_hitl_classification_enabled() {
+        if let Some(slot) = slot {
+            slot.release_snapshot();
+        }
         return super::relay::evaluate_l7_request(engine, ctx, info);
     }
     // Classification must never replace native authorization, even when a
@@ -288,7 +318,7 @@ pub(crate) fn evaluate_http_l7_request(
         }
         Ok(decision)
     });
-    let eligibility = assess_rest_hitl_candidate(
+    let mut eligibility = assess_rest_hitl_candidate(
         engine.http_hitl_classification_enabled(),
         !engine.is_stale(),
         config,
@@ -299,6 +329,27 @@ pub(crate) fn evaluate_http_l7_request(
     let kind = result
         .as_ref()
         .map_or(L7DecisionKind::EvaluationError, |d| d.kind);
+    if slot.as_ref().is_some_and(|slot| {
+        slot.frozen()
+            .is_some_and(|frozen| frozen.buffered_after_header() != 0)
+    }) && eligibility == RestHitlEligibility::EligibleForReview
+    {
+        eligibility = RestHitlEligibility::Ineligible(RestHitlIneligibleReason::InvalidFraming);
+    }
+    if let Some(slot) = slot {
+        if eligibility == RestHitlEligibility::EligibleForReview
+            && slot
+                .record_classification(engine.generation_guard(), request, kind, eligibility)
+                .is_err()
+        {
+            slot.invalidate_classification();
+            eligibility =
+                RestHitlEligibility::Ineligible(RestHitlIneligibleReason::EvaluationError);
+        }
+        if eligibility != RestHitlEligibility::EligibleForReview {
+            slot.release_snapshot();
+        }
+    }
     // This is a classification event, not an approval/application/execute event.
     let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
         .activity(ActivityId::Other)

@@ -5354,6 +5354,58 @@ async fn handle_forward_proxy(
     activity_tx: Option<&ActivitySender>,
     endpoint_observation_tx: Option<EndpointObservationSender>,
 ) -> Result<()> {
+    // The adapter already owns the original ProxyClient/reader and first
+    // header. Keep an allocation-free slot outside generation-local work;
+    // copy wire bytes only if the REST observation branch needs a snapshot.
+    let mut slot = crate::l7::session::RequestSlot::new();
+    Box::pin(handle_forward_proxy_in_slot(
+        method,
+        target_uri,
+        buf,
+        used,
+        client,
+        supplied_identity,
+        socket_addrs,
+        opa_engine,
+        identity_cache,
+        entrypoint_pid,
+        policy_local_ctx,
+        agent_proposals,
+        backend_host_gateway,
+        trusted_host_gateway,
+        provider_credentials,
+        secret_resolver,
+        denial_tx,
+        activity_tx,
+        endpoint_observation_tx,
+        &mut slot,
+    ))
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_forward_proxy_in_slot(
+    method: &str,
+    target_uri: &str,
+    buf: &[u8],
+    used: usize,
+    client: &mut ProxyClient,
+    supplied_identity: Option<&Result<ContractBinaryIdentity, ResolveError>>,
+    socket_addrs: Option<(SocketAddr, SocketAddr)>,
+    opa_engine: Arc<OpaEngine>,
+    identity_cache: Arc<BinaryIdentityCache>,
+    entrypoint_pid: Arc<AtomicU32>,
+    policy_local_ctx: Option<Arc<PolicyLocalContext>>,
+    agent_proposals: openshell_core::proposals::AgentProposals,
+    backend_host_gateway: Arc<Option<IpAddr>>,
+    trusted_host_gateway: Arc<Option<IpAddr>>,
+    provider_credentials: Option<ProviderCredentialState>,
+    secret_resolver: Option<Arc<SecretResolver>>,
+    denial_tx: Option<&mpsc::UnboundedSender<DenialEvent>>,
+    activity_tx: Option<&ActivitySender>,
+    endpoint_observation_tx: Option<EndpointObservationSender>,
+    slot: &mut crate::l7::session::RequestSlot,
+) -> Result<()> {
     let endpoint_observation_context = endpoint_observation_tx
         .as_ref()
         .and_then(EndpointObservationSender::capture);
@@ -6045,12 +6097,15 @@ async fn handle_forward_proxy(
                         forward_request_bytes.clone(),
                     )
                     .and_then(|request| {
-                        crate::l7::hitl::evaluate_http_l7_request(
+                        slot.capture_buffer()?.extend_from_slice(&buf[..used]);
+                        slot.freeze(request.clone(), client.buffer().len())?;
+                        crate::l7::hitl::evaluate_http_l7_request_with_slot(
                             &tunnel_engine,
                             &l7_ctx,
                             &l7_config.config,
                             &request,
                             &request_info,
+                            slot,
                         )
                     })
                 } else {

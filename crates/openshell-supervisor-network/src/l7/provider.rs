@@ -35,7 +35,7 @@ pub enum RelayOutcome {
 }
 
 /// Body framing for HTTP requests/responses.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BodyLength {
     /// Fixed-length body via Content-Length header.
     ContentLength(u64),
@@ -46,7 +46,7 @@ pub enum BodyLength {
 }
 
 /// A parsed L7 request ready for policy evaluation and forwarding.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct L7Request {
     /// Protocol action: HTTP method or SQL command.
     pub action: String,

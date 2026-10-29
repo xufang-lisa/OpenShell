@@ -34,6 +34,22 @@ pub(super) struct RelayContext<'a> {
     middleware_engine: &'a OpaEngine,
 }
 
+impl RelayContext<'_> {
+    fn generation_guard(&self) -> &PolicyGenerationGuard {
+        match &self.policy {
+            PreparedHttpPolicy::Inspect { evaluator, .. } => evaluator.generation_guard(),
+            PreparedHttpPolicy::Passthrough { generation_guard } => generation_guard,
+        }
+    }
+}
+
+/// Exit reason only, never permission to replay or reuse an upstream socket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum HttpRelayExit {
+    Finished,
+    PolicyChanged,
+}
+
 /// Non-blocking observation channels attached to an authorized HTTP relay.
 pub(super) struct RelaySignals {
     /// Receives general sandbox network activity.
@@ -239,38 +255,58 @@ where
     C: AsyncRead + AsyncWrite + Unpin + Send,
     U: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    // The generation-local future may be dropped by select!. Keep the exact
-    // client TCP/TLS object, reader and capture slot outside that future.
+    // Native caller still closes on policy changes. A future admitted waiter
+    // must own the session itself and use the explicit exit-reason boundary.
     let mut session = crate::l7::session::HttpSession::new(client);
-    match context.policy {
+    let guard = context.generation_guard().clone();
+    let request = context.request;
+    if relay_http_stream_in_session(&mut session, upstream, context).await?
+        == HttpRelayExit::PolicyChanged
+    {
+        emit_stale_relay_close(request, &guard);
+    }
+    Ok(())
+}
+
+/// Keep client ownership outside the adapter's own cancellation boundary.
+/// A policy change invalidates observation but does not close this session.
+/// The caller must not replay after writes or bypass fresh admission: this
+/// result carries no authority and deliberately performs no automatic retry.
+pub(super) async fn relay_http_stream_in_session<C, U>(
+    session: &mut crate::l7::session::HttpSession<C>,
+    upstream: &mut U,
+    context: RelayContext<'_>,
+) -> Result<HttpRelayExit>
+where
+    C: AsyncRead + AsyncWrite + Unpin + Send,
+    U: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let generation_guard = context.generation_guard().clone();
+    let result = match context.policy {
         PreparedHttpPolicy::Inspect { configs, evaluator } if configs.len() == 1 => {
-            let generation_guard = evaluator.generation_guard().clone();
             tokio::select! {
                 result = crate::l7::relay::relay_with_inspection_in_session(
                     &configs[0],
                     *evaluator,
-                    &mut session,
+                    session,
                     upstream,
                     context.request,
                 ) => result,
                 () = generation_guard.wait_until_stale() => {
-                    emit_stale_relay_close(context.request, &generation_guard);
                     Ok(())
                 }
             }
         }
         PreparedHttpPolicy::Inspect { configs, evaluator } => {
-            let generation_guard = evaluator.generation_guard().clone();
             tokio::select! {
                 result = crate::l7::relay::relay_with_route_selection_in_session(
                     &configs,
                     *evaluator,
-                    &mut session,
+                    session,
                     upstream,
                     context.request,
                 ) => result,
                 () = generation_guard.wait_until_stale() => {
-                    emit_stale_relay_close(context.request, &generation_guard);
                     Ok(())
                 }
             }
@@ -286,11 +322,20 @@ where
                     Some(context.middleware_engine),
                 ) => result,
                 () = generation_guard.wait_until_stale() => {
-                    emit_stale_relay_close(context.request, &generation_guard);
                     Ok(())
                 }
             }
         }
+    };
+    result?;
+    // Inner protocol guards may also detect stale and return normally. Do not
+    // mistake that for a completed exchange merely because select chose it.
+    if generation_guard.is_stale() {
+        let (_, slot) = session.parts();
+        slot.invalidate_classification();
+        Ok(HttpRelayExit::PolicyChanged)
+    } else {
+        Ok(HttpRelayExit::Finished)
     }
 }
 
@@ -401,6 +446,212 @@ mod tests {
             workspace: String::new(),
             endpoint_observation_tx: None,
         }
+    }
+
+    fn inspected_context<'a>(
+        engine: &'a OpaEngine,
+        request: &'a L7EvalContext,
+        selected: bool,
+    ) -> RelayContext<'a> {
+        let config = crate::l7::parse_l7_config(
+            &serde_json::from_value(serde_json::json!({
+                "protocol": "rest", "enforcement": "enforce"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        RelayContext {
+            request,
+            policy: PreparedHttpPolicy::Inspect {
+                configs: if selected {
+                    vec![config; 2]
+                } else {
+                    vec![config]
+                },
+                evaluator: Box::new(
+                    engine
+                        .clone_engine_for_tunnel(engine.current_generation())
+                        .unwrap(),
+                ),
+            },
+            middleware_engine: engine,
+        }
+    }
+
+    #[tokio::test]
+    async fn adapter_policy_exit_preserves_partial_client_for_explicit_fresh_reentry() {
+        use futures::poll;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for selected in [false, true] {
+            let engine = OpaEngine::from_strings(POLICY_REGO, EMPTY_POLICY_DATA).unwrap();
+            engine.set_http_hitl_classification_enabled(true);
+            let request = request_context();
+            let (mut wire, client) = tokio::io::duplex(8192);
+            let mut session = crate::l7::session::HttpSession::new(client);
+            let (mut old_upstream, mut old_peer) = tokio::io::duplex(8192);
+            let prefix = b"GET /missing HTTP/1.1\r\nHost: example.com\r";
+            wire.write_all(prefix).await.unwrap();
+            {
+                let context = inspected_context(&engine, &request, selected);
+                let exchange = relay_http_stream_in_session(&mut session, &mut old_peer, context);
+                tokio::pin!(exchange);
+                assert!(poll!(exchange.as_mut()).is_pending());
+                engine.reload(POLICY_REGO, EMPTY_POLICY_DATA).unwrap();
+                assert_eq!(exchange.await.unwrap(), HttpRelayExit::PolicyChanged);
+            }
+            assert_eq!(session.slot().partial_header(), prefix);
+            assert_eq!(
+                session.slot().state(),
+                crate::l7::session::CaptureState::Capturing
+            );
+            drop(old_peer);
+            let mut old_bytes = Vec::new();
+            old_upstream.read_to_end(&mut old_bytes).await.unwrap();
+            assert!(old_bytes.is_empty());
+
+            // The caller supplies both a fresh snapshot and a different
+            // upstream, not a retry hidden inside the adapter. Native deny
+            // needs no DNS, identity admission or credential resolution.
+            let (mut new_upstream, mut new_peer) = tokio::io::duplex(8192);
+            wire.write_all(b"\n\r\n").await.unwrap();
+            assert_eq!(
+                relay_http_stream_in_session(
+                    &mut session,
+                    &mut new_peer,
+                    inspected_context(&engine, &request, selected),
+                )
+                .await
+                .unwrap(),
+                HttpRelayExit::Finished
+            );
+            let mut response = [0; 1024];
+            let count = wire.read(&mut response).await.unwrap();
+            assert!(response[..count].starts_with(b"HTTP/1.1 403"));
+            drop(new_peer);
+            let mut new_bytes = Vec::new();
+            new_upstream.read_to_end(&mut new_bytes).await.unwrap();
+            assert!(new_bytes.is_empty());
+            session.terminate().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn tls_adapter_policy_exit_keeps_original_handshake_and_reader() {
+        use crate::l7::tls::{CertCache, ProxyTlsState, SandboxCa};
+        use futures::poll;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let ca = SandboxCa::generate().unwrap();
+            let mut roots = rustls::RootCertStore::empty();
+            for certificate in rustls_pemfile::certs(&mut ca.cert_pem().as_bytes()) {
+                roots.add(certificate.unwrap()).unwrap();
+            }
+            let config = Arc::new(
+                openshell_crypto::tls::client_builder()
+                    .with_root_certificates(roots)
+                    .with_no_client_auth(),
+            );
+            let state = ProxyTlsState::new(CertCache::new(ca), config.clone());
+            let (wire, client) = tokio::io::duplex(64 * 1024);
+            let (wire, client) = tokio::join!(
+                crate::l7::tls::tls_connect_upstream(wire, "example.com", &config),
+                crate::l7::tls::tls_terminate_client(client, &state, "example.com"),
+            );
+            let mut wire = wire.unwrap();
+            let mut session = crate::l7::session::HttpSession::new(client.unwrap());
+            let engine = OpaEngine::from_strings(POLICY_REGO, EMPTY_POLICY_DATA).unwrap();
+            engine.set_http_hitl_classification_enabled(true);
+            let request = request_context();
+            let (mut upstream, mut peer) = tokio::io::duplex(8192);
+            let prefix = b"GET /missing HTTP/1.1\r\nHost: example.com\r";
+            wire.write_all(prefix).await.unwrap();
+            wire.flush().await.unwrap();
+            {
+                let context = inspected_context(&engine, &request, false);
+                let exchange = relay_http_stream_in_session(&mut session, &mut peer, context);
+                tokio::pin!(exchange);
+                assert!(poll!(exchange.as_mut()).is_pending());
+                engine.reload(POLICY_REGO, EMPTY_POLICY_DATA).unwrap();
+                assert_eq!(exchange.await.unwrap(), HttpRelayExit::PolicyChanged);
+            }
+            assert_eq!(session.slot().partial_header(), prefix);
+            drop(peer);
+            let mut sent = Vec::new();
+            upstream.read_to_end(&mut sent).await.unwrap();
+            assert!(sent.is_empty());
+            wire.write_all(b"\n\r\n").await.unwrap();
+            wire.flush().await.unwrap();
+            let (_fresh_upstream, mut fresh_peer) = tokio::io::duplex(8192);
+            assert_eq!(
+                relay_http_stream_in_session(
+                    &mut session,
+                    &mut fresh_peer,
+                    inspected_context(&engine, &request, false),
+                )
+                .await
+                .unwrap(),
+                HttpRelayExit::Finished
+            );
+            let mut response = [0; 1024];
+            let count = wire.read(&mut response).await.unwrap();
+            assert!(response[..count].starts_with(b"HTTP/1.1 403"));
+            session.terminate().await.unwrap();
+            let mut remainder = Vec::new();
+            wire.read_to_end(&mut remainder).await.unwrap();
+        })
+        .await
+        .expect("retaining the original TLS stream must not require another handshake");
+    }
+
+    #[tokio::test]
+    async fn adapter_stale_before_classification_keeps_frozen_q_until_terminal() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let engine = OpaEngine::from_strings(POLICY_REGO, EMPTY_POLICY_DATA).unwrap();
+        engine.set_http_hitl_classification_enabled(true);
+        let request = request_context();
+        let context = inspected_context(&engine, &request, false);
+        let (mut wire, client) = tokio::io::duplex(8192);
+        let mut session = crate::l7::session::HttpSession::new(client);
+        let header = b"GET /missing HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        wire.write_all(header).await.unwrap();
+        let captured_at = {
+            let (reader, slot) = session.parts();
+            crate::l7::rest::RestProvider::default()
+                .capture_request(reader, slot)
+                .await
+                .unwrap();
+            slot.frozen().unwrap().captured_at()
+        };
+        engine.reload(POLICY_REGO, EMPTY_POLICY_DATA).unwrap();
+        let (mut upstream, mut peer) = tokio::io::duplex(8192);
+        assert_eq!(
+            relay_http_stream_in_session(&mut session, &mut peer, context)
+                .await
+                .unwrap(),
+            HttpRelayExit::PolicyChanged
+        );
+        let frozen = session.slot().frozen().unwrap();
+        assert_eq!(frozen.captured_header(), header);
+        assert_eq!(frozen.captured_at(), captured_at);
+        assert_eq!(
+            session.slot().state(),
+            crate::l7::session::CaptureState::Frozen
+        );
+        drop(peer);
+        let mut bytes = Vec::new();
+        upstream.read_to_end(&mut bytes).await.unwrap();
+        assert!(bytes.is_empty());
+        session.terminate().await.unwrap();
+        assert_eq!(
+            session.slot().state(),
+            crate::l7::session::CaptureState::Terminal
+        );
+        let mut response = Vec::new();
+        wire.read_to_end(&mut response).await.unwrap();
+        assert!(response.is_empty());
     }
 
     async fn assert_response_lifecycle<C, P>(mut caller: C, mut client: P)

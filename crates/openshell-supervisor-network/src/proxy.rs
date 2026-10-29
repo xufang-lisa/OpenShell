@@ -3,6 +3,7 @@
 
 //! HTTP CONNECT proxy with OPA policy evaluation and process-identity binding.
 
+mod capture;
 pub(crate) mod destination;
 mod egress;
 mod relay;
@@ -2475,11 +2476,27 @@ async fn handle_mediated_connection(
         };
     let metadata_deadline = metadata_transparent
         .then(|| tokio::time::Instant::now() + std::time::Duration::from_secs(5));
-    let mut buf = vec![0u8; MAX_HEADER_BYTES];
-    let mut used = 0usize;
-
-    loop {
-        if used == buf.len() {
+    // Exists before the first cancellable read, not only after dispatch has
+    // already selected FORWARD. The exact client reader remains outer-owned.
+    let mut first_request_slot = crate::l7::session::RequestSlot::new();
+    let capture = capture::capture_proxy_header(&mut client, &mut first_request_slot);
+    let captured = if let Some(deadline) = metadata_deadline {
+        if let Ok(result) = tokio::time::timeout_at(deadline, capture).await {
+            result?
+        } else {
+            respond(
+                &mut client,
+                b"HTTP/1.1 408 Request Timeout\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+            )
+            .await?;
+            return Ok(());
+        }
+    } else {
+        capture.await?
+    };
+    match captured {
+        capture::HeaderCapture::Closed => return Ok(()),
+        capture::HeaderCapture::TooLarge => {
             respond(
                 &mut client,
                 b"HTTP/1.1 431 Request Header Fields Too Large\r\n\r\n",
@@ -2487,37 +2504,12 @@ async fn handle_mediated_connection(
             .await?;
             return Ok(());
         }
-
-        // A mediated open's first workload bytes follow the synthesized CONNECT header.
-        // Take only the header out of the reader so the bytes behind it stay buffered for
-        // the relay; overlap three bytes so a terminator split across fills is found.
-        let available = if let Some(deadline) = metadata_deadline {
-            if let Ok(result) = tokio::time::timeout_at(deadline, client.fill_buf()).await {
-                result.into_diagnostic()?
-            } else {
-                respond(&mut client, b"HTTP/1.1 408 Request Timeout\r\nConnection: close\r\nContent-Length: 0\r\n\r\n").await?;
-                return Ok(());
-            }
-        } else {
-            client.fill_buf().await.into_diagnostic()?
-        };
-        if available.is_empty() {
-            return Ok(());
-        }
-        let n = available.len().min(buf.len() - used);
-        buf[used..used + n].copy_from_slice(&available[..n]);
-        let start = used.saturating_sub(3);
-        let end = buf[start..used + n]
-            .windows(4)
-            .position(|window| window == b"\r\n\r\n")
-            .map(|position| start + position + 4);
-        let consumed = end.map_or(n, |end| end - used);
-        client.consume(consumed);
-        used += consumed;
-        if end.is_some() {
-            break;
-        }
+        capture::HeaderCapture::Complete => {}
     }
+    // Transfer, don't clone. This outer dispatch keeps the wire header alive
+    // across FORWARD's borrowed generation-local work and native rewriting.
+    let buf = first_request_slot.take_dispatch_header()?;
+    let used = buf.len();
 
     let header_end = buf[..used]
         .windows(4)
@@ -2592,7 +2584,7 @@ async fn handle_mediated_connection(
     }
 
     if method != "CONNECT" {
-        return Box::pin(handle_forward_proxy(
+        return Box::pin(handle_forward_proxy_in_slot(
             method,
             target,
             &buf[..],
@@ -2612,6 +2604,7 @@ async fn handle_mediated_connection(
             denial_tx.as_ref(),
             activity_tx.as_ref(),
             endpoint_observation_tx,
+            &mut first_request_slot,
         ))
         .await;
     }
@@ -5333,6 +5326,7 @@ async fn inject_token_grant_for_forward_request(
 // Many distinct, non-related context parameters are required for forward proxy
 // dispatch; bundling them into a struct would just shift the noise into call sites.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 async fn handle_forward_proxy(
     method: &str,
     target_uri: &str,

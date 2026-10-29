@@ -120,6 +120,16 @@ impl RequestSlot {
         Ok(&mut self.partial_header)
     }
 
+    /// Move a complete proxy envelope to its outer dispatch owner. The owner
+    /// keeps these wire bytes while FORWARD derives and freezes canonical Q.
+    pub(crate) fn take_dispatch_header(&mut self) -> Result<Vec<u8>> {
+        let buffer = self.capture_buffer()?;
+        if !buffer.ends_with(b"\r\n\r\n") {
+            return Err(miette!("proxy header capture is incomplete"));
+        }
+        Ok(std::mem::take(buffer))
+    }
+
     /// Move the completed header to native processing without cloning it.
     /// There must be no await between this transfer and synchronous parsing.
     pub(crate) fn take_unretained_header(&mut self) -> Result<Vec<u8>> {

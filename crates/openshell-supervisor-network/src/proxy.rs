@@ -360,11 +360,13 @@ impl ProxyHandle {
         }
 
         let (exited_tx, exited_rx) = tokio::sync::oneshot::channel::<()>();
+        let wait_shutdown = opa_engine.http_hitl_wait_runtime().shutdown_guard();
         let join = tokio::spawn(async move {
             // Hold the sender for the lifetime of this task — when the task
             // exits (panic, abort, or loop break), the sender drops and the
             // receiver fires, notifying the sandbox that the proxy is gone.
             let _proxy_exit_guard = exited_tx;
+            let _wait_shutdown = wait_shutdown;
 
             // Wait for the OPA engine's symlink resolution reload to complete
             // before accepting connections. This prevents requests from
@@ -2479,6 +2481,7 @@ async fn handle_mediated_connection(
     // Exists before the first cancellable read, not only after dispatch has
     // already selected FORWARD. The exact client reader remains outer-owned.
     let mut first_request_slot = crate::l7::session::RequestSlot::new();
+    first_request_slot.enable_wait_admission();
     let capture = capture::capture_proxy_header(&mut client, &mut first_request_slot);
     let captured = if let Some(deadline) = metadata_deadline {
         if let Ok(result) = tokio::time::timeout_at(deadline, capture).await {
@@ -2584,7 +2587,7 @@ async fn handle_mediated_connection(
     }
 
     if method != "CONNECT" {
-        return Box::pin(handle_forward_proxy_in_slot(
+        let result = Box::pin(handle_forward_proxy_in_slot(
             method,
             target,
             &buf[..],
@@ -2607,6 +2610,14 @@ async fn handle_mediated_connection(
             &mut first_request_slot,
         ))
         .await;
+        if first_request_slot.is_waiting() {
+            // Move the original ingress reader and Q together. Field drop
+            // order aborts transport before the reservation is released.
+            let mut session =
+                crate::l7::session::HttpSession::from_reader(client, first_request_slot);
+            let _ = session.wait_no_release().await;
+        }
+        return result;
     }
 
     let (raw_host, port) = parse_target(target)?;
@@ -3083,15 +3094,15 @@ async fn handle_mediated_connection(
             // Complete the client handshake before observing the upstream
             // connection. A malformed client handshake provides no evidence
             // of an endpoint network failure.
-            let mut tls_client =
-                match crate::l7::tls::tls_terminate_client(client, tls, &host_lc).await {
-                    Ok(client) => client,
-                    Err(error) => {
-                        debug!(host = %host_lc, port, "client TLS handshake failed");
-                        return Err(error);
-                    }
-                };
-            let mut tls_upstream = match crate::l7::tls::tls_connect_upstream(
+            let tls_client = match crate::l7::tls::tls_terminate_client(client, tls, &host_lc).await
+            {
+                Ok(client) => client,
+                Err(error) => {
+                    debug!(host = %host_lc, port, "client TLS handshake failed");
+                    return Err(error);
+                }
+            };
+            let tls_upstream = match crate::l7::tls::tls_connect_upstream(
                 upstream,
                 &host_lc,
                 tls.upstream_config(),
@@ -3121,7 +3132,12 @@ async fn handle_mediated_connection(
                     return Ok(());
                 };
 
-                relay::relay_http_stream(&mut tls_client, &mut tls_upstream, relay_context).await
+                Box::pin(relay::relay_http_stream(
+                    tls_client,
+                    tls_upstream,
+                    relay_context,
+                ))
+                .await
             };
             if let Err(e) = Box::pin(tls_result).await {
                 if is_benign_relay_error(&e) {
@@ -3194,7 +3210,7 @@ async fn handle_mediated_connection(
         else {
             return Ok(());
         };
-        if let Err(e) = relay::relay_http_stream(&mut client, &mut upstream, relay_context).await {
+        if let Err(e) = relay::relay_http_stream(client, upstream, relay_context).await {
             if is_benign_relay_error(&e) {
                 if is_l7_relay {
                     debug!(host = %host_lc, port = port, error = %e, "L7 connection closed");
@@ -6082,7 +6098,7 @@ async fn handle_forward_proxy_in_slot(
         let (allowed, reason) = hard_deny_reason.map_or_else(
             || {
                 let evaluation = if l7_config.config.protocol == crate::l7::L7Protocol::Rest
-                    && tunnel_engine.http_hitl_classification_enabled()
+                    && tunnel_engine.http_hitl_capture_enabled()
                 {
                     crate::l7::rest::request_from_buffered_http(
                         request_info.action.clone(),
@@ -6194,6 +6210,11 @@ async fn handle_forward_proxy_in_slot(
 
         let effectively_denied = force_deny
             || (!allowed && l7_config.config.enforcement == crate::l7::EnforcementMode::Enforce);
+
+        if effectively_denied && !force_deny && slot.try_begin_wait(&tunnel_engine, &host_lc, port)
+        {
+            return Ok(());
+        }
 
         if effectively_denied {
             emit_activity_simple(activity_tx, true, "l7_policy");
@@ -7161,6 +7182,8 @@ fn is_benign_relay_error(err: &miette::Report) -> bool {
     reason = "Test code: test fixtures and explicit control-flow markers are idiomatic in tests."
 )]
 mod tests {
+    mod http_wait;
+
     #[test]
     fn proxy_authorization_rejects_missing_wrong_cross_and_duplicate_credentials() {
         let expected = "Basic sandbox-a-generation";

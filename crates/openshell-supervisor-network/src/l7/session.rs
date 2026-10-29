@@ -12,6 +12,7 @@ use super::hitl::{L7DecisionKind, RestHitlEligibility};
 use super::provider::L7Request;
 use crate::opa::PolicyGenerationGuard;
 use miette::{Result, miette};
+use openshell_ocsf::{ActivityId, Endpoint, NetworkActivityBuilder, SeverityId, ocsf_emit};
 use tokio::io::BufReader;
 use tokio::time::Instant;
 
@@ -23,6 +24,8 @@ pub enum CaptureState {
     Capturing,
     Frozen,
     Classified,
+    /// Bounded no-release wait; this is NOT evidence of a durable proposal.
+    PendingReview,
     /// Native processing owns the request; no review snapshot is retained.
     Exchanging,
     Terminal,
@@ -77,6 +80,10 @@ pub struct RequestSlot {
     frozen: Option<FrozenRequest>,
     classification: Option<CapturedClassification>,
     classification_guard: Option<PolicyGenerationGuard>,
+    capture_completed_at: Option<Instant>,
+    wait_admission_enabled: bool,
+    // Must outlive transport abort. Terminal clears Q, not this charge.
+    waiter: Option<super::wait::WaitReservation>,
 }
 
 impl Default for RequestSlot {
@@ -94,6 +101,9 @@ impl RequestSlot {
             frozen: None,
             classification: None,
             classification_guard: None,
+            capture_completed_at: None,
+            wait_admission_enabled: false,
+            waiter: None,
         }
     }
 
@@ -127,7 +137,9 @@ impl RequestSlot {
         if !buffer.ends_with(b"\r\n\r\n") {
             return Err(miette!("proxy header capture is incomplete"));
         }
-        Ok(std::mem::take(buffer))
+        let header = std::mem::take(buffer);
+        self.capture_completed_at = Some(Instant::now());
+        Ok(header)
     }
 
     /// Move the completed header to native processing without cloning it.
@@ -159,7 +171,7 @@ impl RequestSlot {
         self.frozen = Some(FrozenRequest {
             captured_header: std::mem::take(&mut self.partial_header),
             request,
-            captured_at: Instant::now(),
+            captured_at: self.capture_completed_at.unwrap_or_else(Instant::now),
             buffered_after_header,
         });
         self.state = CaptureState::Frozen;
@@ -178,7 +190,7 @@ impl RequestSlot {
         let frozen = self
             .frozen()
             .ok_or_else(|| miette!("classification requires a frozen request"))?;
-        if self.state == CaptureState::Terminal
+        if !matches!(self.state, CaptureState::Frozen | CaptureState::Classified)
             || frozen.request.action != request.action
             || frozen.request.target != request.target
             || frozen.request.query_params != request.query_params
@@ -219,6 +231,59 @@ impl RequestSlot {
         }
     }
 
+    /// Only a production transport owner may opt into the pending-wait exit.
+    /// Legacy borrowed L7 helpers keep their native deny behavior.
+    pub(crate) fn enable_wait_admission(&mut self) {
+        self.wait_admission_enabled = true;
+    }
+
+    pub(crate) fn is_waiting(&self) -> bool {
+        self.state == CaptureState::PendingReview
+    }
+
+    pub(crate) fn try_begin_wait(
+        &mut self,
+        engine: &crate::opa::TunnelPolicyEngine,
+        host: &str,
+        port: u16,
+    ) -> bool {
+        if !self.wait_admission_enabled
+            || self.state != CaptureState::Classified
+            || !self
+                .classification(engine.generation_guard())
+                .is_some_and(|value| value.eligibility == RestHitlEligibility::EligibleForReview)
+        {
+            return false;
+        }
+        let Some(frozen) = self.frozen.as_ref() else {
+            return false;
+        };
+        let Some(reservation) =
+            engine
+                .http_hitl_wait_runtime()
+                .reserve(host, port, frozen.captured_at)
+        else {
+            return false;
+        };
+        if engine.is_stale() {
+            return false;
+        }
+        self.waiter = Some(reservation);
+        self.state = CaptureState::PendingReview;
+        // Admission was classified, but it conveys NO retained execution
+        // authority. No policy/evaluator is needed by the waiting owner.
+        self.invalidate_classification();
+        ocsf_emit!(
+            NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                .activity(ActivityId::Other)
+                .severity(SeverityId::Informational)
+                .dst_endpoint(Endpoint::from_domain(host, port))
+                .message("HTTP_HITL_WAIT admitted; release disabled")
+                .build()
+        );
+        true
+    }
+
     /// Advance only after the native response completed and declared reusable.
     /// Never call this to recover from cancellation or a policy reload.
     pub(crate) fn complete_exchange(&mut self) -> Result<()> {
@@ -228,7 +293,9 @@ impl RequestSlot {
         ) {
             return Err(miette!("request slot has no completed exchange"));
         }
+        let wait_admission_enabled = self.wait_admission_enabled;
         *self = Self::new();
+        self.wait_admission_enabled = wait_admission_enabled;
         Ok(())
     }
 
@@ -245,6 +312,8 @@ impl RequestSlot {
 /// Original TCP/TLS object, reader and request slot outlive borrowed exchanges.
 /// No evaluator, upstream socket, credential resolver or grant is stored here.
 pub struct HttpSession<C> {
+    // Rust drops fields in declaration order: definitive transport abort
+    // MUST precede dropping the slot's quota reservation, including aborts.
     client: BufReader<C>,
     slot: RequestSlot,
 }
@@ -252,10 +321,39 @@ pub struct HttpSession<C> {
 impl<C: tokio::io::AsyncRead> HttpSession<C> {
     #[must_use]
     pub fn new(client: C) -> Self {
-        Self {
-            client: BufReader::with_capacity(READ_AHEAD_BYTES, client),
-            slot: RequestSlot::new(),
+        Self::from_reader(
+            BufReader::with_capacity(READ_AHEAD_BYTES, client),
+            RequestSlot::new(),
+        )
+    }
+
+    /// Move the SAME ingress reader, retaining all read-ahead. No `into_inner`.
+    pub(crate) fn from_reader(client: BufReader<C>, slot: RequestSlot) -> Self {
+        Self { client, slot }
+    }
+
+    /// No detached watcher tasks. The caller must own the transport and drop
+    /// this session on return; shutdown/flush is not awaited without a bound.
+    pub(crate) async fn wait_no_release(&mut self) -> Option<super::wait::WaitEnd>
+    where
+        C: Unpin,
+    {
+        if !self.slot.is_waiting() {
+            return None;
         }
+        let waiter = self.slot.waiter.as_ref()?;
+        let reason = waiter.wait(&mut self.client).await;
+        let (host, port) = waiter.destination();
+        ocsf_emit!(
+            NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                .activity(ActivityId::Other)
+                .severity(SeverityId::Informational)
+                .dst_endpoint(Endpoint::from_domain(host, port))
+                .message(format!("HTTP_HITL_WAIT terminal={reason:?}; no release"))
+                .build()
+        );
+        self.slot.terminate();
+        Some(reason)
     }
 
     /// Borrow without unwrapping the reader or replacing the client TLS object.

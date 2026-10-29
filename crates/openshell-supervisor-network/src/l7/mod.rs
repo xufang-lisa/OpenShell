@@ -21,6 +21,7 @@ pub mod rest;
 pub mod session;
 pub mod tls;
 pub(crate) mod token_grant_injection;
+pub(crate) mod wait;
 pub(crate) mod websocket;
 
 use openshell_core::endpoint_status::{

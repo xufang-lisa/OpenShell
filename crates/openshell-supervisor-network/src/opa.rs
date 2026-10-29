@@ -179,6 +179,7 @@ pub struct OpaEngine {
     engine: Mutex<regorus::Engine>,
     binary_identity_required: bool,
     http_hitl_classification_enabled: Arc<AtomicBool>,
+    http_hitl_wait: Arc<crate::l7::wait::WaitRuntime>,
     generation: Arc<AtomicU64>,
     middleware_runner: RwLock<ChainRunner>,
     websocket_assembly_budget: crate::l7::websocket::WebSocketAssemblyBudget,
@@ -262,11 +263,20 @@ pub struct TunnelPolicyEngine {
     engine: Mutex<regorus::Engine>,
     generation_guard: PolicyGenerationGuard,
     http_hitl_classification_enabled: Arc<AtomicBool>,
+    http_hitl_wait: Arc<crate::l7::wait::WaitRuntime>,
     middleware_runner: ChainRunner,
     websocket_assembly_budget: crate::l7::websocket::WebSocketAssemblyBudget,
 }
 
 impl TunnelPolicyEngine {
+    pub(crate) fn http_hitl_capture_enabled(&self) -> bool {
+        self.http_hitl_classification_enabled() || self.http_hitl_wait.enabled()
+    }
+
+    pub(crate) fn http_hitl_wait_runtime(&self) -> &Arc<crate::l7::wait::WaitRuntime> {
+        &self.http_hitl_wait
+    }
+
     pub(crate) fn http_hitl_classification_enabled(&self) -> bool {
         self.http_hitl_classification_enabled
             .load(Ordering::Acquire)
@@ -313,6 +323,19 @@ impl TunnelPolicyEngine {
 }
 
 impl OpaEngine {
+    /// Opt in only to bounded no-release waiting, never approval or forwarding.
+    pub fn set_http_hitl_wait_enabled(&self, enabled: bool) {
+        self.http_hitl_wait.configure(enabled);
+    }
+
+    pub fn http_hitl_wait_enabled(&self) -> bool {
+        self.http_hitl_wait.enabled()
+    }
+
+    pub(crate) fn http_hitl_wait_runtime(&self) -> &Arc<crate::l7::wait::WaitRuntime> {
+        &self.http_hitl_wait
+    }
+
     pub fn http_hitl_classification_enabled(&self) -> bool {
         self.http_hitl_classification_enabled
             .load(Ordering::Acquire)
@@ -337,6 +360,7 @@ impl OpaEngine {
             engine: Mutex::new(engine),
             binary_identity_required,
             http_hitl_classification_enabled: Arc::new(AtomicBool::new(false)),
+            http_hitl_wait: Arc::new(crate::l7::wait::WaitRuntime::default()),
             generation,
             middleware_runner: RwLock::new(ChainRunner::default()),
             websocket_assembly_budget: crate::l7::websocket::WebSocketAssemblyBudget::default(),
@@ -837,6 +861,7 @@ impl OpaEngine {
             *runner = new_runner;
         }
         *fail_closed_reason = None;
+        self.http_hitl_wait.recover();
         self.generation_guard(generation)
     }
 
@@ -857,6 +882,7 @@ impl OpaEngine {
             .write()
             .map_err(|_| miette::miette!("OPA fail-closed state lock poisoned"))? =
             Some(reason.into());
+        self.http_hitl_wait.quarantine();
         Ok(self.advance_generation())
     }
 
@@ -881,6 +907,7 @@ impl OpaEngine {
             .take()
             .is_some();
         if was_fail_closed {
+            self.http_hitl_wait.recover();
             Ok(self.advance_generation())
         } else {
             Ok(self.current_generation())
@@ -1156,6 +1183,7 @@ impl OpaEngine {
         Ok(TunnelPolicyEngine {
             engine: Mutex::new(engine.clone()),
             http_hitl_classification_enabled: self.http_hitl_classification_enabled.clone(),
+            http_hitl_wait: self.http_hitl_wait.clone(),
             generation_guard: PolicyGenerationGuard {
                 captured_generation: generation,
                 current_generation: Arc::clone(&self.generation),

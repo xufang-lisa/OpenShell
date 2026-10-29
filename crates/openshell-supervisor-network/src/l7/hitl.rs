@@ -301,7 +301,7 @@ fn evaluate_http_l7_request_observed(
     if let Some(slot) = slot.as_deref_mut() {
         slot.invalidate_classification();
     }
-    if config.protocol != L7Protocol::Rest || !engine.http_hitl_classification_enabled() {
+    if config.protocol != L7Protocol::Rest || !engine.http_hitl_capture_enabled() {
         if let Some(slot) = slot {
             slot.release_snapshot();
         }
@@ -319,7 +319,7 @@ fn evaluate_http_l7_request_observed(
         Ok(decision)
     });
     let mut eligibility = assess_rest_hitl_candidate(
-        engine.http_hitl_classification_enabled(),
+        engine.http_hitl_capture_enabled(),
         !engine.is_stale(),
         config,
         ctx,

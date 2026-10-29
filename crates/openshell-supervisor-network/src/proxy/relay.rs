@@ -48,6 +48,7 @@ impl RelayContext<'_> {
 pub(super) enum HttpRelayExit {
     Finished,
     PolicyChanged,
+    PendingReview,
 }
 
 /// Non-blocking observation channels attached to an authorized HTTP relay.
@@ -247,23 +248,29 @@ pub(super) fn prepare_raw_relay(
 /// function. Forward HTTP will provide a buffered first request to the same
 /// boundary in the next migration step.
 pub(super) async fn relay_http_stream<C, U>(
-    client: &mut C,
-    upstream: &mut U,
+    client: C,
+    mut upstream: U,
     context: RelayContext<'_>,
 ) -> Result<()>
 where
     C: AsyncRead + AsyncWrite + Unpin + Send,
     U: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    // Native caller still closes on policy changes. A future admitted waiter
-    // must own the session itself and use the explicit exit-reason boundary.
+    // Own the real client transport. Legacy callers may still borrow when
+    // waiting is disabled; production CONNECT callers transfer ownership.
     let mut session = crate::l7::session::HttpSession::new(client);
+    session.parts().1.enable_wait_admission();
     let guard = context.generation_guard().clone();
     let request = context.request;
-    if relay_http_stream_in_session(&mut session, upstream, context).await?
-        == HttpRelayExit::PolicyChanged
-    {
-        emit_stale_relay_close(request, &guard);
+    match relay_http_stream_in_session(&mut session, &mut upstream, context).await? {
+        HttpRelayExit::PendingReview => {
+            // Drop old upstream/evaluator before the client begins waiting.
+            // There is no fresh dial, policy re-entry, or write in this slice.
+            drop(upstream);
+            let _ = session.wait_no_release().await;
+        }
+        HttpRelayExit::PolicyChanged => emit_stale_relay_close(request, &guard),
+        HttpRelayExit::Finished => {}
     }
     Ok(())
 }
@@ -328,6 +335,9 @@ where
         }
     };
     result?;
+    if session.slot().is_waiting() {
+        return Ok(HttpRelayExit::PendingReview);
+    }
     // Inner protocol guards may also detect stale and return normally. Do not
     // mistake that for a completed exchange merely because select chose it.
     if generation_guard.is_stale() {
@@ -404,6 +414,8 @@ fn emit_stale_relay_close(request: &L7EvalContext, guard: &PolicyGenerationGuard
 
 #[cfg(test)]
 mod tests {
+    mod wait_tests;
+
     use super::super::{EgressIntent, EndpointDecision, ProcessIdentityEvidence};
     use super::*;
 

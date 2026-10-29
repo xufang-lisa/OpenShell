@@ -1511,6 +1511,15 @@ pub fn apply_http_hitl_classification_setting(
         )
         .unwrap_or(false),
     );
+    // Independent opt-in. Missing or malformed values disable and cancel
+    // existing waiters, without turning observation into a wait permission.
+    engine.set_http_hitl_wait_enabled(
+        extract_bool_setting(
+            settings,
+            openshell_core::settings::HTTP_HITL_WAIT_ENABLED_KEY,
+        )
+        .unwrap_or(false),
+    );
 }
 
 pub fn agent_proposals_enabled_from_settings(
@@ -1782,6 +1791,41 @@ mod tests {
         settings.clear();
         apply_http_hitl_classification_setting(&engine, &settings);
         assert!(!engine.http_hitl_classification_enabled());
+    }
+
+    #[test]
+    fn http_hitl_wait_setting_is_independent_and_fail_closed() {
+        let engine = OpaEngine::from_strings(
+            "package openshell.sandbox\nallow_request := false\n",
+            "network_policies: {}\n",
+        )
+        .unwrap();
+        let key = openshell_core::settings::HTTP_HITL_WAIT_ENABLED_KEY.to_string();
+        let mut settings = std::collections::HashMap::new();
+        apply_http_hitl_classification_setting(&engine, &settings);
+        assert!(!engine.http_hitl_wait_enabled());
+        settings.insert(key.clone(), effective_bool(true));
+        apply_http_hitl_classification_setting(&engine, &settings);
+        assert!(engine.http_hitl_wait_enabled());
+        assert!(!engine.http_hitl_classification_enabled());
+        assert!(!agent_proposals_enabled_from_settings(&settings));
+        settings.insert(
+            key,
+            openshell_core::proto::EffectiveSetting {
+                value: Some(openshell_core::proto::SettingValue {
+                    value: Some(openshell_core::proto::setting_value::Value::StringValue(
+                        "true".into(),
+                    )),
+                }),
+                scope: openshell_core::proto::SettingScope::Sandbox.into(),
+            },
+        );
+        apply_http_hitl_classification_setting(&engine, &settings);
+        assert!(!engine.http_hitl_wait_enabled());
+        engine.set_http_hitl_wait_enabled(true);
+        settings.clear();
+        apply_http_hitl_classification_setting(&engine, &settings);
+        assert!(!engine.http_hitl_wait_enabled());
     }
 
     #[test]

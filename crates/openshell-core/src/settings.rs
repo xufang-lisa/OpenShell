@@ -88,6 +88,12 @@ pub const AGENT_POLICY_PROPOSALS_ENABLED_KEY: &str = "agent_policy_proposals_ena
 /// not hold requests, submit proposals, grant authority, or forward denials.
 pub const HTTP_HITL_CLASSIFICATION_ENABLED_KEY: &str = "http_hitl_classification_enabled";
 
+/// Default-off bounded HTTP waiting, currently NO RELEASE.
+///
+/// This preserves an eligible client request until cancellation/expiry; it does not create an
+/// approval proposal or forward it, even after a policy reload or approval.
+pub const HTTP_HITL_WAIT_ENABLED_KEY: &str = "http_hitl_wait_enabled";
+
 /// Approval mode for agent-authored policy proposals.
 ///
 /// `"manual"` (the default when unset): every proposal lands in the draft
@@ -147,6 +153,11 @@ pub const REGISTERED_SETTINGS: &[RegisteredSetting] = &[
         kind: SettingValueKind::Bool,
         allowed_string_values: None,
     },
+    RegisteredSetting {
+        key: HTTP_HITL_WAIT_ENABLED_KEY,
+        kind: SettingValueKind::Bool,
+        allowed_string_values: None,
+    },
     // Approval mode for agent-authored proposals. See
     // PROPOSAL_APPROVAL_MODE_KEY for details. Defaults to manual.
     RegisteredSetting {
@@ -199,6 +210,14 @@ mod tests {
     fn http_hitl_classification_is_a_registered_boolean_setting() {
         let setting = setting_for_key(super::HTTP_HITL_CLASSIFICATION_ENABLED_KEY).unwrap();
         assert_eq!(setting.kind, SettingValueKind::Bool);
+        assert!(setting.allowed_string_values.is_none());
+    }
+
+    #[test]
+    fn http_hitl_wait_is_a_separate_registered_boolean_setting() {
+        let setting = setting_for_key(super::HTTP_HITL_WAIT_ENABLED_KEY).unwrap();
+        assert_eq!(setting.kind, SettingValueKind::Bool);
+        assert_ne!(setting.key, super::HTTP_HITL_CLASSIFICATION_ENABLED_KEY);
         assert!(setting.allowed_string_values.is_none());
     }
 

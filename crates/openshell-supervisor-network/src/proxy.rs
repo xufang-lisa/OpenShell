@@ -6103,7 +6103,7 @@ async fn handle_forward_proxy_in_slot(
                     crate::l7::rest::request_from_buffered_http(
                         request_info.action.clone(),
                         path.clone(),
-                        &path,
+                        &upstream_target,
                         forward_request_bytes.clone(),
                     )
                     .and_then(|request| {

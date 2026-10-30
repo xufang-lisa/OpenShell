@@ -60,3 +60,23 @@ belong to the sandbox or isolation backend. Signals use `BoundarySignal`.
 
 These portable control-plane foundations do not qualify a platform isolation
 backend or enable a Windows workload runtime.
+
+## Held HTTP proposals (no release)
+
+When gateway/sandbox inputs are available, startup installs the internal HTTP HITL
+proposal service before networking. This does not enable the default-off wait
+setting. Admitted requests use a non-generalizing mode of the existing mechanistic
+mapper and the existing authenticated `SubmitPolicyAnalysis` RPC, independently
+of the background agent-proposals aggregator.
+
+One launch UUID plus a content fingerprint supplies stable retry IDs. Submission
+is serialized with one-second attempt spacing, a ten-second connect/RPC timeout,
+and a sixteen-entry accepted-ID cache. Current workspace is checked across awaits.
+No detached per-request submission task is created. The gateway persists a
+namespaced deduplication key, preserves edited/terminal chunks on retry, isolates
+these proposals from endpoint-folding/supersession, and excludes them from
+auto-approval. These labels do not authenticate supervisor provenance.
+
+Native GET/HEAD, method folding, query and executable-or-ancestor effects are
+explicit in the review rationale. This increment neither changes policy matching
+nor consumes decisions or resumes a held request.

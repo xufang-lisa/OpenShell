@@ -14,9 +14,10 @@
 
 use openshell_core::net::{is_always_blocked_ip, is_internal_ip, is_known_metadata_hostname};
 use openshell_core::proto::{
-    DenialSummary, L7Allow, L7Rule, NetworkBinary, NetworkEndpoint, NetworkEnforcementMode,
-    NetworkPolicyRule, PolicyChunk,
+    DenialSummary, L7Allow, L7RequestSample, L7Rule, NetworkBinary, NetworkEndpoint,
+    NetworkEnforcementMode, NetworkPolicyRule, PolicyChunk, SandboxPolicy,
 };
+use openshell_supervisor_network::l7::proposal::HeldProposalInput;
 use std::collections::HashMap;
 use std::net::IpAddr;
 
@@ -58,6 +59,79 @@ const WELL_KNOWN_PORTS: &[(u16, &str)] = &[
 ///
 /// Returns an empty vec if there are no actionable denials.
 pub fn generate_proposals(summaries: &[DenialSummary]) -> Vec<PolicyChunk> {
+    generate_proposals_with_mode(summaries, MapperMode::Generalizing)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MapperMode {
+    Generalizing,
+    Held,
+}
+
+/// Reuse the ordinary mapper without widening the held request's native rule.
+pub fn generate_held_proposal(input: &HeldProposalInput) -> Option<PolicyChunk> {
+    generate_held_candidate(
+        input.scope(),
+        input.method(),
+        input.path(),
+        input.binary(),
+        input.review_metadata(),
+    )
+}
+
+fn generate_held_candidate(
+    scope: &NetworkPolicyRule,
+    method: &str,
+    path: &str,
+    binary: &str,
+    review_metadata: String,
+) -> Option<PolicyChunk> {
+    let [endpoint] = scope.endpoints.as_slice() else {
+        return None;
+    };
+    let summary = DenialSummary {
+        host: endpoint.host.clone(),
+        port: endpoint.port,
+        binary: binary.to_string(),
+        count: 1,
+        denial_stage: "http-hitl".into(),
+        l7_inspection_active: true,
+        l7_request_samples: vec![L7RequestSample {
+            method: method.to_string(),
+            path: path.to_string(),
+            count: 1,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let mut chunk = generate_proposals_with_mode(&[summary], MapperMode::Held)
+        .into_iter()
+        .next()?;
+    let mut candidate = scope.clone();
+    candidate.endpoints[0]
+        .rules
+        .clone_from(&chunk.proposed_rule.as_ref()?.endpoints[0].rules);
+    // Hash a name-independent skeleton, including all original constraints and
+    // literal executable/ancestor scopes. Review metadata is not policy identity.
+    candidate.name.clear();
+    let mut skeleton = SandboxPolicy::default();
+    // Include the actual executable even when native scope is an ancestor.
+    skeleton
+        .network_policies
+        .insert(format!("candidate:{binary}"), candidate.clone());
+    let name = format!(
+        "{}{}",
+        openshell_core::proposals::HTTP_HITL_RULE_PREFIX,
+        openshell_core::policy_identity::deterministic_policy_hash(&skeleton)
+    );
+    candidate.name.clone_from(&name);
+    chunk.rule_name = name;
+    chunk.proposed_rule = Some(candidate);
+    chunk.rationale = review_metadata;
+    Some(chunk)
+}
+
+fn generate_proposals_with_mode(summaries: &[DenialSummary], mode: MapperMode) -> Vec<PolicyChunk> {
     // Group denials by (host, port, binary).
     let mut groups: HashMap<(String, u32, String), Vec<&DenialSummary>> = HashMap::new();
 
@@ -117,17 +191,19 @@ pub fn generate_proposals(summaries: &[DenialSummary]) -> Vec<PolicyChunk> {
         // be denied at runtime regardless of policy, producing an infinite
         // proposal loop in the TUI.
         if is_always_blocked_destination(host) {
-            tracing::info!(
-                host,
-                port,
-                "Skipped proposal for always-blocked destination \
-                 (SSRF hardening — loopback/link-local/unspecified/metadata)"
-            );
+            if mode == MapperMode::Generalizing {
+                tracing::info!(
+                    host,
+                    port,
+                    "Skipped proposal for always-blocked destination \
+                     (SSRF hardening — loopback/link-local/unspecified/metadata)"
+                );
+            }
             continue;
         }
 
         // Build proposed NetworkPolicyRule.
-        let l7_rules = build_l7_rules(&l7_methods);
+        let l7_rules = build_l7_rules(&l7_methods, mode == MapperMode::Generalizing);
         let endpoint = if has_l7 && !l7_rules.is_empty() {
             NetworkEndpoint {
                 host: host.clone(),
@@ -335,13 +411,17 @@ fn generate_security_notes(host: &str, port: u16, is_ssrf: bool) -> String {
 ///   - `/api/v2/users/42`  → `/api/v2/users/*` (numeric trailing segment)
 ///
 /// Falls back to the exact observed path when no pattern applies.
-fn build_l7_rules(samples: &HashMap<(String, String), u32>) -> Vec<L7Rule> {
+fn build_l7_rules(samples: &HashMap<(String, String), u32>, generalize: bool) -> Vec<L7Rule> {
     // Deduplicate after generalisation.
     let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
     let mut rules = Vec::new();
 
     for (method, path) in samples.keys() {
-        let generalised = generalise_path(path);
+        let generalised = if generalize {
+            generalise_path(path)
+        } else {
+            path.clone()
+        };
         let key = (method.clone(), generalised.clone());
         if !seen.insert(key) {
             continue;
@@ -443,6 +523,152 @@ fn is_always_blocked_destination(host: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn held_scope() -> NetworkPolicyRule {
+        NetworkPolicyRule {
+            name: "original".into(),
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/parent".into(),
+            }],
+            endpoints: vec![NetworkEndpoint {
+                host: "api.example.com".into(),
+                port: 443,
+                ports: vec![443],
+                protocol: "rest".into(),
+                enforcement: NetworkEnforcementMode::Enforce as i32,
+                tls: openshell_core::proto::NetworkTlsMode::Skip as i32,
+                allowed_ips: vec!["10.0.0.0/8".into()],
+                path: "/items/**".into(),
+                deny_rules: vec![openshell_core::proto::L7DenyRule::default()],
+                credential_binding: Some(openshell_core::proto::NetworkCredentialBinding::default()),
+                credential_signing: "sigv4".into(),
+                signing_service: "service".into(),
+                signing_region: "region".into(),
+                request_body_credential_rewrite: true,
+                advisor_proposed: true,
+                ..Default::default()
+            }],
+        }
+    }
+
+    #[test]
+    fn held_mapper_preserves_literal_request_and_original_scope() {
+        let scope = held_scope();
+        let chunk = generate_held_candidate(
+            &scope,
+            "gEt",
+            "/items/12345",
+            "/usr/bin/child",
+            "review semantics".into(),
+        )
+        .unwrap();
+        let rule = chunk.proposed_rule.as_ref().unwrap();
+        let allow = rule.endpoints[0].rules[0].allow.as_ref().unwrap();
+        assert_eq!(allow.method, "gEt");
+        assert_eq!(allow.path, "/items/12345");
+        assert!(allow.query.is_empty());
+        assert_eq!(rule.endpoints[0].rules.len(), 1);
+        let mut endpoint = rule.endpoints[0].clone();
+        endpoint.rules.clear();
+        assert_eq!(endpoint, scope.endpoints[0]);
+        assert_eq!(rule.binaries, scope.binaries);
+        assert_eq!(chunk.rationale, "review semantics");
+        assert_eq!(chunk.stage, "http-hitl");
+        assert_eq!(chunk.binary, "/usr/bin/child");
+        assert_eq!(rule.name, chunk.rule_name);
+    }
+
+    #[test]
+    fn held_mapper_names_are_stable_and_distinguish_method_path_and_binary() {
+        let scope = held_scope();
+        let candidate = |method, path, binary, metadata: &str| {
+            generate_held_candidate(&scope, method, path, binary, metadata.into()).unwrap()
+        };
+        let original = candidate("GET", "/items/42", "/usr/bin/child", "workspace A");
+        assert_eq!(
+            original.rule_name,
+            candidate("GET", "/items/42", "/usr/bin/child", "workspace B").rule_name
+        );
+        for changed in [
+            candidate("POST", "/items/42", "/usr/bin/child", "workspace A"),
+            candidate("GET", "/items/43", "/usr/bin/child", "workspace A"),
+            candidate("GET", "/items/42", "/usr/bin/other", "workspace A"),
+        ] {
+            assert_ne!(original.rule_name, changed.rule_name);
+        }
+        assert!(
+            original
+                .rule_name
+                .starts_with(openshell_core::proposals::HTTP_HITL_RULE_PREFIX)
+        );
+        assert_eq!(
+            original.rule_name.len(),
+            openshell_core::proposals::HTTP_HITL_RULE_PREFIX.len() + 64
+        );
+        let mut changed_scope = scope.clone();
+        changed_scope.endpoints[0]
+            .allowed_ips
+            .push("192.168.0.0/16".into());
+        assert_ne!(
+            original.rule_name,
+            generate_held_candidate(
+                &changed_scope,
+                "GET",
+                "/items/42",
+                "/usr/bin/child",
+                "workspace A".into()
+            )
+            .unwrap()
+            .rule_name
+        );
+    }
+
+    #[test]
+    fn held_mapper_does_not_change_query_matching_or_accept_multiple_endpoints() {
+        let mut scope = held_scope();
+        let chunk = generate_held_candidate(
+            &scope,
+            "GET",
+            "/items/42?key=value",
+            "/usr/bin/child",
+            String::new(),
+        )
+        .unwrap();
+        // Extraction normally disallows query-bearing input; the mapper itself
+        // must never silently strip or reinterpret any supplied sample.
+        let allow = chunk.proposed_rule.unwrap().endpoints[0].rules[0]
+            .allow
+            .clone()
+            .unwrap();
+        assert_eq!(allow.path, "/items/42?key=value");
+        assert!(allow.query.is_empty());
+        scope.endpoints.push(scope.endpoints[0].clone());
+        assert!(
+            generate_held_candidate(&scope, "GET", "/items/42", "/usr/bin/child", String::new())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn ordinary_mapper_still_generalizes_numeric_ids() {
+        let samples = HashMap::from([(("GET".into(), "/items/12345".into()), 1)]);
+        assert_eq!(
+            build_l7_rules(&samples, true)[0]
+                .allow
+                .as_ref()
+                .unwrap()
+                .path,
+            "/items/*"
+        );
+        assert_eq!(
+            build_l7_rules(&samples, false)[0]
+                .allow
+                .as_ref()
+                .unwrap()
+                .path,
+            "/items/12345"
+        );
+    }
 
     #[test]
     fn test_generate_rule_name() {

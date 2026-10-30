@@ -84,6 +84,9 @@ pub struct RequestSlot {
     wait_admission_enabled: bool,
     // Must outlive transport abort. Terminal clears Q, not this charge.
     waiter: Option<super::wait::WaitReservation>,
+    proposal_input: Option<super::proposal::HeldProposalInput>,
+    submitted_proposal: Option<String>,
+    review_request_id: Option<String>,
 }
 
 impl Default for RequestSlot {
@@ -104,6 +107,9 @@ impl RequestSlot {
             capture_completed_at: None,
             wait_admission_enabled: false,
             waiter: None,
+            proposal_input: None,
+            submitted_proposal: None,
+            review_request_id: None,
         }
     }
 
@@ -115,6 +121,23 @@ impl RequestSlot {
     #[must_use]
     pub fn frozen(&self) -> Option<&FrozenRequest> {
         self.frozen.as_ref()
+    }
+
+    /// Accepted durable chunk associated with this individual waiter. It is
+    /// not an approval, installation acknowledgment, or forwarding permit.
+    #[must_use]
+    pub fn submitted_proposal(&self) -> Option<&str> {
+        self.submitted_proposal.as_deref()
+    }
+
+    /// Opaque per-waiter correlation, never part of shared proposal identity.
+    #[must_use]
+    pub fn review_request_id(&self) -> Option<&str> {
+        self.review_request_id.as_deref()
+    }
+
+    pub(crate) fn set_proposal_input(&mut self, input: super::proposal::HeldProposalInput) {
+        self.proposal_input = Some(input);
     }
 
     /// Includes bytes consumed before a cancelled parsing future. Never log it.
@@ -226,6 +249,9 @@ impl RequestSlot {
     pub fn invalidate_classification(&mut self) {
         self.classification = None;
         self.classification_guard = None;
+        if self.state != CaptureState::PendingReview {
+            self.proposal_input = None;
+        }
         if self.state == CaptureState::Classified {
             self.state = CaptureState::Frozen;
         }
@@ -258,6 +284,11 @@ impl RequestSlot {
         let Some(frozen) = self.frozen.as_ref() else {
             return false;
         };
+        if engine.http_hitl_wait_runtime().proposal_service().is_some()
+            && self.proposal_input.is_none()
+        {
+            return false;
+        }
         let Some(reservation) =
             engine
                 .http_hitl_wait_runtime()
@@ -269,6 +300,7 @@ impl RequestSlot {
             return false;
         }
         self.waiter = Some(reservation);
+        self.review_request_id = Some(uuid::Uuid::new_v4().to_string());
         self.state = CaptureState::PendingReview;
         // Admission was classified, but it conveys NO retained execution
         // authority. No policy/evaluator is needed by the waiting owner.
@@ -278,6 +310,7 @@ impl RequestSlot {
                 .activity(ActivityId::Other)
                 .severity(SeverityId::Informational)
                 .dst_endpoint(Endpoint::from_domain(host, port))
+                .unmapped("request_id", serde_json::json!(self.review_request_id))
                 .message("HTTP_HITL_WAIT admitted; release disabled")
                 .build()
         );
@@ -305,6 +338,7 @@ impl RequestSlot {
         self.frozen = None;
         self.classification = None;
         self.classification_guard = None;
+        self.proposal_input = None;
         self.state = CaptureState::Terminal;
     }
 }
@@ -342,13 +376,62 @@ impl<C: tokio::io::AsyncRead> HttpSession<C> {
             return None;
         }
         let waiter = self.slot.waiter.as_ref()?;
-        let reason = waiter.wait(&mut self.client).await;
+        let reason = 'waiting: {
+            if self.slot.submitted_proposal.is_none()
+                && let (Some(service), Some(input)) =
+                    (waiter.proposal_service(), self.slot.proposal_input.as_ref())
+            {
+                let submission = async {
+                    loop {
+                        match service.submit(input).await {
+                            Ok(chunk_id) if !chunk_id.is_empty() => break Some(chunk_id),
+                            Ok(_) | Err(super::proposal::ProposalSubmitError::Unavailable) => {
+                                break None;
+                            }
+                            Err(super::proposal::ProposalSubmitError::Retryable) => {
+                                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                            }
+                        }
+                    }
+                };
+                // Same original deadline, transport and terminal watchers during
+                // connect, queued submission and retry. Never detach submission.
+                tokio::select! {
+                    biased;
+                    reason = waiter.wait(&mut self.client) => {
+                        break 'waiting reason;
+                    }
+                    chunk_id = submission => {
+                        self.slot.submitted_proposal = chunk_id;
+                    }
+                }
+                if self.slot.submitted_proposal.is_none() {
+                    break 'waiting super::wait::WaitEnd::ProposalUnavailable;
+                }
+                ocsf_emit!(
+                    NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                        .activity(ActivityId::Other)
+                        .severity(SeverityId::Informational)
+                        .dst_endpoint(Endpoint::from_domain(
+                            waiter.destination().0,
+                            waiter.destination().1
+                        ))
+                        .unmapped("request_id", serde_json::json!(self.slot.review_request_id))
+                        .unmapped("chunk_id", serde_json::json!(self.slot.submitted_proposal))
+                        .message("HTTP_HITL_PROPOSAL accepted; release disabled")
+                        .build()
+                );
+            }
+            waiter.wait(&mut self.client).await
+        };
         let (host, port) = waiter.destination();
         ocsf_emit!(
             NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
                 .activity(ActivityId::Other)
                 .severity(SeverityId::Informational)
                 .dst_endpoint(Endpoint::from_domain(host, port))
+                .unmapped("request_id", serde_json::json!(self.slot.review_request_id))
+                .unmapped("chunk_id", serde_json::json!(self.slot.submitted_proposal))
                 .message(format!("HTTP_HITL_WAIT terminal={reason:?}; no release"))
                 .build()
         );

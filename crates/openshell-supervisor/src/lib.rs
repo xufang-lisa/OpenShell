@@ -22,6 +22,7 @@ pub mod backend_setup;
 mod config_runtime;
 mod denial_aggregator;
 mod endpoint_status;
+mod http_hitl;
 mod mechanistic_mapper;
 mod provider_readiness;
 
@@ -1075,6 +1076,17 @@ pub async fn run_sandbox_with_backend(
     // GetSandboxConfig and broadcasts it. Flush tasks and the policy.local
     // API read the current value so proposals target the correct workspace.
     let (workspace_tx, workspace_rx) = tokio::sync::watch::channel(String::new());
+    if let (Some(engine), Some(endpoint), Some(name)) = (
+        opa_engine.as_ref(),
+        openshell_endpoint_for_proxy.as_ref(),
+        sandbox_name_for_agg.as_ref().or(sandbox_id.as_ref()),
+    ) {
+        engine.set_http_hitl_proposal_service(Arc::new(http_hitl::ProposalService::new(
+            endpoint.clone(),
+            name.clone(),
+            workspace_rx.clone(),
+        )));
+    }
     // The supervisor session hands pushed configuration to the poll loop and
     // tells it when to stop polling.
     let (config_apply_tx, config_apply_rx) = tokio::sync::mpsc::channel(16);

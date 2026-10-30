@@ -346,6 +346,13 @@ fn evaluate_http_l7_request_observed(
             eligibility =
                 RestHitlEligibility::Ineligible(RestHitlIneligibleReason::EvaluationError);
         }
+        if eligibility == RestHitlEligibility::EligibleForReview
+            && let Some(input) = slot
+                .frozen()
+                .and_then(|frozen| super::proposal::extract(engine, ctx, config, frozen))
+        {
+            slot.set_proposal_input(input);
+        }
         if eligibility != RestHitlEligibility::EligibleForReview {
             slot.release_snapshot();
         }

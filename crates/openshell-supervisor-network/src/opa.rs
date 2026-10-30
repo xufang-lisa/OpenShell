@@ -323,6 +323,15 @@ impl TunnelPolicyEngine {
 }
 
 impl OpaEngine {
+    /// Wire the trusted supervisor's immediate proposal service. This does not
+    /// enable waiting or confer any forwarding authority.
+    pub fn set_http_hitl_proposal_service(
+        &self,
+        service: Arc<dyn crate::l7::proposal::HeldProposalService>,
+    ) {
+        self.http_hitl_wait.set_proposal_service(service);
+    }
+
     /// Opt in only to bounded no-release waiting, never approval or forwarding.
     pub fn set_http_hitl_wait_enabled(&self, enabled: bool) {
         self.http_hitl_wait.configure(enabled);

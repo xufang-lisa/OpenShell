@@ -20,6 +20,7 @@ pub enum WaitEnd {
     Disabled,
     Quarantined,
     Shutdown,
+    ProposalUnavailable,
 }
 
 struct Population {
@@ -36,6 +37,7 @@ struct Population {
 
 pub struct WaitRuntime {
     population: Mutex<Population>,
+    proposal_service: Mutex<Option<Arc<dyn super::proposal::HeldProposalService>>>,
     changed: watch::Sender<u64>,
     budget: Duration,
     sandbox_limit: usize,
@@ -61,6 +63,7 @@ impl WaitRuntime {
             return Err(miette::miette!("HTTP wait limits must tighten 300s/16/4"));
         }
         Ok(Self {
+            proposal_service: Mutex::new(None),
             population: Mutex::new(Population {
                 enabled: false,
                 quarantined: false,
@@ -81,6 +84,20 @@ impl WaitRuntime {
         self.population
             .lock()
             .is_ok_and(|state| state.enabled && !state.shutdown)
+    }
+
+    pub(crate) fn set_proposal_service(
+        &self,
+        service: Arc<dyn super::proposal::HeldProposalService>,
+    ) {
+        *self
+            .proposal_service
+            .lock()
+            .expect("HTTP proposal service lock poisoned") = Some(service);
+    }
+
+    pub(crate) fn proposal_service(&self) -> Option<Arc<dyn super::proposal::HeldProposalService>> {
+        self.proposal_service.lock().ok()?.clone()
     }
 
     pub(crate) fn configure(&self, enabled: bool) {
@@ -179,6 +196,10 @@ pub struct WaitReservation {
 }
 
 impl WaitReservation {
+    pub(crate) fn proposal_service(&self) -> Option<Arc<dyn super::proposal::HeldProposalService>> {
+        self.runtime.proposal_service()
+    }
+
     pub(crate) fn destination(&self) -> (&str, u16) {
         (&self.key.0, self.key.1)
     }

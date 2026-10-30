@@ -15,6 +15,7 @@ pub mod jsonrpc;
 pub(crate) mod mcp;
 pub(crate) mod middleware;
 pub mod path;
+pub mod proposal;
 pub mod provider;
 pub mod relay;
 pub mod rest;

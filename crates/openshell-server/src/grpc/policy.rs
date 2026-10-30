@@ -49,6 +49,9 @@ use metrics::counter;
 use openshell_core::net::{is_always_blocked_ip, is_internal_ip};
 use openshell_core::policy_identity::canonical_rule_bytes;
 pub use openshell_core::policy_identity::deterministic_policy_hash;
+use openshell_core::proposals::{
+    HTTP_HITL_ANALYSIS_MODE, HTTP_HITL_RULE_PREFIX, http_hitl_submission_key,
+};
 #[cfg(test)]
 use openshell_core::proto::StaticCredentialBinding;
 use openshell_core::proto::policy_merge_operation;
@@ -1391,6 +1394,7 @@ async fn supersede_other_pending_chunks_for_endpoint(
     let now_ms = current_time_ms();
     for other in pending {
         if other.id == new_chunk_id
+            || other.rule_name.starts_with(HTTP_HITL_RULE_PREFIX)
             || other.host != host
             || other.port != port
             || other.binary != binary
@@ -1491,9 +1495,13 @@ async fn self_reject_mechanistic_if_already_covered(
     // `new_chunk_id` is load-bearing: the dedup upsert can alias the incoming
     // id onto an approved row for this endpoint, and without the exclusion that
     // row would be found as its own "covering" chunk and reject itself.
-    let covered_by = approved
-        .iter()
-        .find(|c| c.id != new_chunk_id && c.host == host && c.port == port && c.binary == binary);
+    let covered_by = approved.iter().find(|c| {
+        c.id != new_chunk_id
+            && !c.rule_name.starts_with(HTTP_HITL_RULE_PREFIX)
+            && c.host == host
+            && c.port == port
+            && c.binary == binary
+    });
     let Some(covering) = covered_by else {
         return;
     };
@@ -1826,7 +1834,7 @@ async fn auto_approve_chunk(
 
     // The chunk may have been superseded or rejected by something else
     // between persist and auto-approve. Only approve from a pending state.
-    if chunk.status != "pending" {
+    if chunk.status != "pending" || chunk.rule_name.starts_with(HTTP_HITL_RULE_PREFIX) {
         return Ok(());
     }
 
@@ -5606,6 +5614,20 @@ pub(super) async fn handle_submit_policy_analysis(
     let mut accepted_chunk_ids: Vec<String> = Vec::new();
 
     for chunk in &req.proposed_chunks {
+        // This envelope is an idempotency contract only. Neither the caller's
+        // mode nor its session UUID authenticates provenance or a live waiter.
+        // Check before candidate evaluation so a reused id with altered input
+        // is rejected rather than silently folded into an existing decision.
+        let http_hitl_key = if req.analysis_mode == HTTP_HITL_ANALYSIS_MODE {
+            let Some(key) = http_hitl_submission_key(chunk) else {
+                rejected += 1;
+                rejection_reasons.push("invalid HTTP HITL submission identity".to_string());
+                continue;
+            };
+            Some(key)
+        } else {
+            None
+        };
         if chunk.rule_name.is_empty() {
             rejected += 1;
             rejection_reasons.push("chunk missing rule_name".to_string());
@@ -5665,16 +5687,32 @@ pub(super) async fn handle_submit_policy_analysis(
         };
 
         let rule_ref = chunk.proposed_rule.as_ref().expect("checked above");
-        if req.analysis_mode == "agent_authored"
-            && let Some(reason) = rule_ref.endpoints.iter().find_map(|endpoint| {
-                openshell_policy::agent_authored_transport_rejection(
-                    &endpoint.protocol,
-                    openshell_policy::network_tls_mode_to_str(endpoint.tls).unwrap_or(""),
-                )
-            })
-        {
+        if matches!(
+            req.analysis_mode.as_str(),
+            "agent_authored" | HTTP_HITL_ANALYSIS_MODE
+        ) && let Some(reason) = rule_ref.endpoints.iter().find_map(|endpoint| {
+            openshell_policy::agent_authored_transport_rejection(
+                &endpoint.protocol,
+                openshell_policy::network_tls_mode_to_str(endpoint.tls).unwrap_or(""),
+            )
+        }) {
             rejected += 1;
             rejection_reasons.push(format!("chunk '{}': {reason}", chunk.rule_name));
+            continue;
+        }
+        if let Some(key) = &http_hitl_key
+            && let Some(existing) = state
+                .store
+                .get_draft_chunk_by_dedup_key(&sandbox_id, key)
+                .await
+                .map_err(|error| {
+                    Status::internal(format!("fetch submission retry failed: {error}"))
+                })?
+        {
+            // Return the persisted decision without evaluating or overwriting
+            // the original candidate: it may have been edited or decided.
+            accepted += 1;
+            accepted_chunk_ids.push(existing.id);
             continue;
         }
         let incoming_observation_key = rule_ref.endpoints.first().and_then(|endpoint| {
@@ -5698,7 +5736,8 @@ pub(super) async fn handle_submit_policy_analysis(
                 .as_ref()
                 .and_then(|(host, port, binary)| {
                     chunks.into_iter().find(|existing| {
-                        existing.host == *host
+                        !existing.rule_name.starts_with(HTTP_HITL_RULE_PREFIX)
+                            && existing.host == *host
                             && existing.port == *port
                             && existing.binary == *binary
                     })
@@ -5809,13 +5848,12 @@ pub(super) async fn handle_submit_policy_analysis(
             current_effective_policy: Some(evaluation.current_effective_policy.clone()),
             candidate_effective_policy: evaluation.candidate_effective_policy.clone(),
         };
-        // Mechanistic mode dedups N denials targeting the same endpoint
-        // into one chunk. All other modes (agent-authored proposals, future
-        // modes) submit each chunk as a distinct row — the redraft loop
-        // relies on it, and the conservative default for an unknown mode
-        // is to keep the proposal rather than silently fold it away.
-        let dedup_key = matches!(req.analysis_mode.as_str(), "mechanistic")
-            .then(|| crate::policy_store::observation_dedup_key(&record));
+        // HTTP HITL retries use session/content identity, never endpoint
+        // observation identity. Unknown modes retain distinct submissions.
+        let dedup_key = http_hitl_key.clone().or_else(|| {
+            (req.analysis_mode == "mechanistic")
+                .then(|| crate::policy_store::observation_dedup_key(&record))
+        });
         let effective_id = state
             .store
             .put_draft_chunk(&record, dedup_key.as_deref(), &workspace)
@@ -5840,15 +5878,17 @@ pub(super) async fn handle_submit_policy_analysis(
         // refine a mechanistic L4 draft into an L7 narrow proposal without
         // any explicit `supersedes_chunk_id` plumbing — the gateway figures
         // out the relationship by structural overlap.
-        supersede_other_pending_chunks_for_endpoint(
-            state,
-            &sandbox,
-            &effective_id,
-            &record.host,
-            record.port,
-            &record.binary,
-        )
-        .await;
+        if http_hitl_key.is_none() {
+            supersede_other_pending_chunks_for_endpoint(
+                state,
+                &sandbox,
+                &effective_id,
+                &record.host,
+                record.port,
+                &record.binary,
+            )
+            .await;
+        }
 
         // Asymmetric self-reject: if this is a mechanistic proposal that
         // arrived AFTER an already-approved agent_authored chunk covered the
@@ -5878,6 +5918,7 @@ pub(super) async fn handle_submit_policy_analysis(
         // string means findings or infrastructure error, both of which
         // require human attention.
         if auto_approve_enabled
+            && http_hitl_key.is_none()
             && let Err(err) = Box::pin(auto_approve_chunk(
                 state,
                 &effective_id,
@@ -8199,6 +8240,8 @@ fn materialize_global_settings(
 
 #[cfg(test)]
 mod tests {
+    mod http_hitl_tests;
+
     use super::*;
     use crate::auth::identity::{Identity, IdentityProvider};
     use crate::auth::principal::{

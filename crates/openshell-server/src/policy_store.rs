@@ -228,6 +228,14 @@ pub trait PolicyStoreExt {
 
     async fn get_draft_chunk(&self, id: &str) -> PersistenceResult<Option<DraftChunkRecord>>;
 
+    /// Fetch the original decision by its sandbox-scoped durable retry key,
+    /// independently of subsequent candidate edits or terminal status.
+    async fn get_draft_chunk_by_dedup_key(
+        &self,
+        sandbox_id: &str,
+        dedup_key: &str,
+    ) -> PersistenceResult<Option<DraftChunkRecord>>;
+
     async fn list_draft_chunks(
         &self,
         sandbox_id: &str,
@@ -439,6 +447,25 @@ impl PolicyStoreExt for Store {
         match self {
             Self::Postgres(store) => store.get_draft_chunk(id).await,
             Self::Sqlite(store) => store.get_draft_chunk(id).await,
+        }
+    }
+
+    async fn get_draft_chunk_by_dedup_key(
+        &self,
+        sandbox_id: &str,
+        dedup_key: &str,
+    ) -> PersistenceResult<Option<DraftChunkRecord>> {
+        match self {
+            Self::Postgres(store) => {
+                store
+                    .get_draft_chunk_by_dedup_key(sandbox_id, dedup_key)
+                    .await
+            }
+            Self::Sqlite(store) => {
+                store
+                    .get_draft_chunk_by_dedup_key(sandbox_id, dedup_key)
+                    .await
+            }
         }
     }
 

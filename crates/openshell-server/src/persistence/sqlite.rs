@@ -1664,6 +1664,27 @@ WHERE "object_type" = ?1 AND "id" = ?2
         row.map(row_to_draft_chunk_record).transpose()
     }
 
+    pub async fn get_draft_chunk_by_dedup_key(
+        &self,
+        sandbox_id: &str,
+        dedup_key: &str,
+    ) -> PersistenceResult<Option<DraftChunkRecord>> {
+        let row = sqlx::query(
+            r#"
+SELECT "id", "scope", "status", "hit_count", "payload", "created_at_ms", "updated_at_ms"
+FROM "objects"
+WHERE "object_type" = ?1 AND "scope" = ?2 AND "dedup_key" = ?3
+"#,
+        )
+        .bind(DRAFT_CHUNK_OBJECT_TYPE)
+        .bind(sandbox_id)
+        .bind(dedup_key)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+        row.map(row_to_draft_chunk_record).transpose()
+    }
+
     pub async fn list_draft_chunks(
         &self,
         sandbox_id: &str,

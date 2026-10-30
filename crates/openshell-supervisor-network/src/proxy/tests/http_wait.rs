@@ -4,6 +4,40 @@
 use super::*;
 use futures::poll;
 
+#[derive(Default)]
+struct HeldIntentRecorder(std::sync::Mutex<Vec<String>>);
+
+impl crate::l7::proposal::HeldProposalService for HeldIntentRecorder {
+    fn submit<'a>(
+        &'a self,
+        input: &'a crate::l7::proposal::HeldProposalInput,
+    ) -> crate::l7::proposal::ProposalSubmission<'a> {
+        Box::pin(async move {
+            assert_eq!(input.method(), "GET");
+            assert_eq!(input.path(), "/missing");
+            assert_eq!(input.workspace(), "fixture-team");
+            assert_eq!(input.scope().endpoints.len(), 1);
+            assert!(input.scope().endpoints[0].rules.is_empty());
+            let metadata = input.review_metadata();
+            for secret in ["query-sentinel", "header-sentinel", "cookie-sentinel"] {
+                assert!(!metadata.contains(secret));
+            }
+            self.0.lock().unwrap().push(metadata);
+            Ok("durable-fixture-chunk".into())
+        })
+    }
+}
+
+fn held_proposal_context() -> Arc<PolicyLocalContext> {
+    Arc::new(PolicyLocalContext::new(
+        None,
+        None,
+        None,
+        AgentProposals::default(),
+        tokio::sync::watch::channel("fixture-team".to_string()).1,
+    ))
+}
+
 #[tokio::test]
 async fn explicit_and_virtual_connect_production_ingress_wait_without_http_writes() {
     let Some(ip) = non_loopback_test_ipv4() else {
@@ -36,6 +70,8 @@ network_policies:
                     .unwrap(),
             );
             engine.set_http_hitl_wait_enabled(true);
+            let recorder = Arc::new(HeldIntentRecorder::default());
+            engine.set_http_hitl_proposal_service(recorder.clone());
             let cache = Arc::new(BinaryIdentityCache::new());
             let identity = ContractBinaryIdentity {
                 executable: ContractExecutableIdentity {
@@ -84,7 +120,7 @@ network_policies:
                 crate::l7::tls::CertCache::new(ca),
                 config,
             ));
-            let header = format!("GET /missing HTTP/1.1\r\nHost: {destination}\r\n\r\n");
+            let header = format!("GET /missing?secret=query-sentinel HTTP/1.1\r\nHost: {destination}\r\nAuthorization: header-sentinel\r\nCookie: cookie-sentinel\r\n\r\n");
             let request = if virtual_connect {
                 header
             } else {
@@ -101,7 +137,7 @@ network_policies:
                 cache,
                 Arc::new(AtomicU32::new(0)),
                 Some(tls),
-                None,
+                Some(held_proposal_context()),
                 AgentProposals::default(),
                 Arc::new(None),
                 Arc::new(None),
@@ -128,6 +164,7 @@ network_policies:
             let mut sent = Vec::new();
             upstream.read_to_end(&mut sent).await.unwrap();
             assert!(sent.is_empty());
+            assert_eq!(recorder.0.lock().unwrap().len(), 1);
             if !virtual_connect {
                 let mut response = [0; 1024];
                 let count = wire.read(&mut response).await.unwrap();
@@ -176,6 +213,8 @@ network_policies:
                 .unwrap(),
         );
         engine.set_http_hitl_wait_enabled(true);
+        let recorder = Arc::new(HeldIntentRecorder::default());
+        engine.set_http_hitl_proposal_service(recorder.clone());
         let identity = ContractBinaryIdentity {
             executable: ContractExecutableIdentity {
                 path: executable_path("/usr/bin/curl"),
@@ -186,7 +225,7 @@ network_policies:
         };
         let (client, mut wire) = tokio::io::duplex(8192);
         let request = format!(
-            "GET http://{destination}/a/../missing HTTP/1.1\r\nHost: {destination}\r\n\r\n"
+            "GET http://{destination}/a/../missing?secret=query-sentinel HTTP/1.1\r\nHost: {destination}\r\nAuthorization: header-sentinel\r\nCookie: cookie-sentinel\r\n\r\n"
         );
         let handler = Box::pin(handle_mediated_connection(
             tokio::io::BufReader::new(Box::new(client)),
@@ -198,7 +237,7 @@ network_policies:
             Arc::new(BinaryIdentityCache::new()),
             Arc::new(AtomicU32::new(0)),
             None,
-            None,
+            Some(held_proposal_context()),
             AgentProposals::default(),
             Arc::new(None),
             Arc::new(None),
@@ -224,6 +263,7 @@ network_policies:
             .unwrap();
         assert!(poll!(handler.as_mut()).is_pending());
         assert_eq!(engine.http_hitl_wait_runtime().population(), 1);
+        assert_eq!(recorder.0.lock().unwrap().len(), 1);
         engine
             .reload(include_str!("../../../data/sandbox-policy.rego"), &data)
             .unwrap();

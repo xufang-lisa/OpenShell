@@ -846,3 +846,199 @@ async fn original_tls_object_survives_partial_capture_cancellation() {
     .await
     .unwrap();
 }
+
+struct ApprovalReviewer(std::sync::Mutex<crate::l7::proposal::ReviewDecision>);
+
+impl crate::l7::proposal::HeldProposalService for ApprovalReviewer {
+    fn submit<'a>(
+        &'a self,
+        _: &'a crate::l7::proposal::HeldProposalInput,
+    ) -> crate::l7::proposal::ProposalSubmission<'a> {
+        Box::pin(async { Ok("session-review".into()) })
+    }
+
+    fn observe<'a>(
+        &'a self,
+        _: &'a str,
+        _: &'a str,
+    ) -> crate::l7::proposal::ProposalObservation<'a> {
+        Box::pin(async { Ok(*self.0.lock().unwrap()) })
+    }
+}
+
+async fn approval_session(
+    engine: &std::sync::Arc<OpaEngine>,
+) -> (
+    tokio::io::DuplexStream,
+    HttpSession<tokio::io::DuplexStream>,
+) {
+    let (mut wire, client) = tokio::io::duplex(8192);
+    wire.write_all(HEADER).await.unwrap();
+    let mut session = HttpSession::new(client);
+    let evaluator = engine
+        .clone_engine_for_tunnel(engine.current_generation())
+        .unwrap();
+    let (reader, slot) = session.parts();
+    slot.enable_wait_admission();
+    let request = RestProvider::default()
+        .capture_request(reader, slot)
+        .await
+        .unwrap()
+        .unwrap();
+    let ctx = L7EvalContext {
+        workspace: "team".into(),
+        ..context()
+    };
+    assert!(
+        !evaluate_http_l7_request_with_slot(
+            &evaluator,
+            &ctx,
+            &config(),
+            &request,
+            &info(&request),
+            slot,
+        )
+        .unwrap()
+        .0
+    );
+    assert!(slot.try_begin_wait(&evaluator, "api.example.test", 80));
+    (wire, session)
+}
+
+#[tokio::test(start_paused = true)]
+async fn approval_wait_hands_off_exactly_one_frozen_request_without_cleanup_or_quota_drop() {
+    use crate::l7::proposal::ReviewDecision;
+    use std::sync::Arc;
+
+    let engine = Arc::new(engine());
+    engine.set_http_hitl_wait_enabled(true);
+    engine.attach_http_hitl_policy_observer();
+    let reviewer = Arc::new(ApprovalReviewer(std::sync::Mutex::new(
+        ReviewDecision::Pending,
+    )));
+    engine.set_http_hitl_proposal_service(reviewer.clone());
+    let (_wire, mut session) = approval_session(&engine).await;
+    let captured_at = session.slot().frozen().unwrap().captured_at();
+    let fence = session.slot().resume_fence().unwrap();
+    assert!(session.slot().readmission_guard(0).is_err());
+
+    // Covering installation alone is not approval; cancelling this observation
+    // future retains the exact capture and the one quota reservation.
+    engine
+        .reload(POLICY, &DATA.replace("path: /allowed", "path: /missing"))
+        .unwrap();
+    {
+        let wait = session.wait_for_approval();
+        tokio::pin!(wait);
+        assert!(poll!(wait.as_mut()).is_pending());
+    }
+    assert_eq!(session.slot().review_progress(), ReviewProgress::Pending);
+    *reviewer.0.lock().unwrap() = ReviewDecision::Approved;
+    assert_eq!(
+        session.wait_for_approval().await,
+        Some(ReviewWaitOutcome::Covered { generation: 1 })
+    );
+    assert_eq!(session.slot().state(), CaptureState::Readmitting);
+    assert!(!session.slot().is_waiting());
+    assert_eq!(session.slot().frozen().unwrap().captured_header(), HEADER);
+    assert_eq!(session.slot().frozen().unwrap().captured_at(), captured_at);
+    assert_eq!(
+        session.slot().review_progress(),
+        ReviewProgress::CoveredNoAuthority { generation: 1 }
+    );
+    assert_eq!(engine.http_hitl_wait_runtime().population(), 1);
+    assert!(Arc::ptr_eq(&fence, &session.slot().resume_fence().unwrap()));
+    let guard = session.slot().readmission_guard(1).unwrap();
+    assert_eq!(session.wait_for_approval().await, None);
+    assert_eq!(session.wait_no_release().await, None);
+    assert!(session.slot.complete_exchange().is_err());
+    engine.reload(POLICY, DATA).unwrap();
+    assert!(guard.is_stale());
+    assert!(matches!(
+        session.slot().readmission_guard(1),
+        Err(super::super::wait::WaitEnd::PolicyChanged)
+    ));
+    session.slot.terminate();
+    assert!(session.slot().frozen().is_none());
+    assert_eq!(engine.http_hitl_wait_runtime().population(), 1);
+    drop(session);
+    assert_eq!(engine.http_hitl_wait_runtime().population(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn approval_without_coverage_keeps_original_deadline_and_terminal_clears_q_not_quota() {
+    use crate::l7::{proposal::ReviewDecision, wait::WaitEnd};
+    use std::sync::Arc;
+
+    let engine = Arc::new(engine());
+    engine.set_http_hitl_wait_enabled(true);
+    engine.attach_http_hitl_policy_observer();
+    engine.set_http_hitl_proposal_service(Arc::new(ApprovalReviewer(std::sync::Mutex::new(
+        ReviewDecision::Approved,
+    ))));
+    let (_wire, mut session) = approval_session(&engine).await;
+    {
+        let wait = session.wait_for_approval();
+        tokio::pin!(wait);
+        assert!(poll!(wait.as_mut()).is_pending());
+    }
+    assert_eq!(
+        session.slot().review_progress(),
+        ReviewProgress::ApprovedAwaitingCoverage
+    );
+    tokio::time::advance(std::time::Duration::from_mins(5)).await;
+    assert_eq!(
+        session.wait_for_approval().await,
+        Some(ReviewWaitOutcome::Terminal(WaitEnd::Deadline))
+    );
+    assert_eq!(session.slot().state(), CaptureState::Terminal);
+    assert!(session.slot().frozen().is_none());
+    assert_eq!(engine.http_hitl_wait_runtime().population(), 1);
+    assert_eq!(session.wait_for_approval().await, None);
+    drop(session);
+    assert_eq!(engine.http_hitl_wait_runtime().population(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn approval_wait_terminal_transport_and_runtime_take_precedence_over_covered() {
+    use crate::l7::{proposal::ReviewDecision, wait::WaitEnd};
+    use std::sync::Arc;
+
+    for reason in [
+        WaitEnd::ClientClosed,
+        WaitEnd::ExtraInput,
+        WaitEnd::Deadline,
+        WaitEnd::Disabled,
+        WaitEnd::Quarantined,
+        WaitEnd::Shutdown,
+    ] {
+        let engine = Arc::new(engine());
+        engine.set_http_hitl_wait_enabled(true);
+        engine.attach_http_hitl_policy_observer();
+        engine.set_http_hitl_proposal_service(Arc::new(ApprovalReviewer(std::sync::Mutex::new(
+            ReviewDecision::Approved,
+        ))));
+        let (mut wire, mut session) = approval_session(&engine).await;
+        engine
+            .reload(POLICY, &DATA.replace("path: /allowed", "path: /missing"))
+            .unwrap();
+        match reason {
+            WaitEnd::ClientClosed => wire.shutdown().await.unwrap(),
+            WaitEnd::ExtraInput => wire.write_all(b"extra").await.unwrap(),
+            WaitEnd::Deadline => tokio::time::advance(std::time::Duration::from_mins(5)).await,
+            WaitEnd::Disabled => engine.set_http_hitl_wait_enabled(false),
+            WaitEnd::Quarantined => engine.http_hitl_wait_runtime().quarantine(),
+            WaitEnd::Shutdown => drop(engine.http_hitl_wait_runtime().shutdown_guard()),
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            session.wait_for_approval().await,
+            Some(ReviewWaitOutcome::Terminal(reason))
+        );
+        assert_eq!(session.slot().state(), CaptureState::Terminal);
+        assert!(session.slot().frozen().is_none());
+        assert_eq!(engine.http_hitl_wait_runtime().population(), 1);
+        drop(session);
+        assert_eq!(engine.http_hitl_wait_runtime().population(), 0);
+    }
+}

@@ -61,7 +61,7 @@ belong to the sandbox or isolation backend. Signals use `BoundarySignal`.
 These portable control-plane foundations do not qualify a platform isolation
 backend or enable a Windows workload runtime.
 
-## Held HTTP proposals (no release)
+## Held HTTP proposals and limited-MVP execution (default off)
 
 When gateway/sandbox inputs are available, startup installs the internal HTTP HITL
 proposal service before networking. This does not enable the default-off wait
@@ -79,7 +79,8 @@ auto-approval. These labels do not authenticate supervisor provenance.
 
 Native GET/HEAD, method folding, query and executable-or-ancestor effects are
 explicit in the review rationale. This increment neither changes policy matching
-nor resumes a held request.
+nor turns proposal acceptance into execution authority. The current network
+owner can separately resume an approved, installed-and-covered frozen request.
 
 The service also reuses authenticated `GetDraftPolicy` for read-only decision
 observation. Active waiter futures cooperatively share one sandbox-wide batch,
@@ -95,5 +96,47 @@ reference to the live policy engine for coverage-only observations. Held drafts
 are excluded from automatic covered-policy queue rejection, while ordinary
 draft behavior is unchanged. Ledger rejection is deliberately not labelled as
 human attribution, since the current API does not expose a decision actor.
-CLI snapshot binding (T5), durable decision replay refinements (full T6), live
-Podman qualification and request execution are outside this increment.
+After approval and coverage, the network owner now attempts a fail-closed
+readmission boundary using the captured trusted connection executable/ancestor
+identity for the immutable original request. Full current-executor continuity
+through exec, inherited/transferred FDs, multiple holders and first write is
+explicitly deferred by the authorized limited-MVP scope, not proved by coverage
+or by the captured identity. The full target contract remains unmet.
+
+The [network owner](../openshell-supervisor-network/src/proxy/held.rs) uses
+`wait_for_approval()` and `readmission_guard()` to pin the observed installed
+generation, then repeats native L4/L7 authorization, route and destination
+DNS/IP/SSRF/allowed-IP checks and applicable fresh upstream TLS. The
+[one-shot relay](../openshell-supervisor-network/src/l7/relay/held.rs) applies
+current middleware and live credential preparation with native policy and
+credential revision/installation guards. No old upstream authority is reused.
+Fresh credential snapshots must be obtained after admission through live provider/
+resolver handles; freezing credential generation or values at capture is not the
+design. Guards continue to protect pending writes and flushes on every re-poll.
+Coverage itself is still not an execution permit.
+
+After TLS, `ApplicationFence` checks every application write/flush/shutdown poll,
+including Pending re-polls. The original capture deadline lasts until the first
+positive HTTP application write, not until TCP connect or TLS handshake.
+Workspace, runtime/epoch, policy and original-client cancellation remain active
+through the exchange. Pending/uncovered requests retain their original wait
+lifetime; quota is returned only after transport drop, never at approval or
+first write. One frozen request returns one response over the original client
+TCP/TLS, then both sides close; errors never cause reconnect/retry/replay.
+
+OCSF terminal exchange outcomes distinguish `not_sent`, `response_observed` and
+`effect_unknown` (HTTP started, then the exchange failed). A response observation
+does not imply business success, and no outcome permits retry. Session WAIT and
+PROPOSAL admission logs now describe awaiting review/fresh admission; REVIEW
+explicitly says observation is not execution authority, not release disabled.
+
+`wait_no_release()` / `readmission_end()` and legacy test adapters retain the
+historical `CurrentExecutorUnavailable` behavior. They are not the current
+production path; older no-release results must not be used to describe it.
+The [final local evidence record](../../../HITL/http-hitl-readmission-boundary-implementation-zh-CN.md#final-local-evidence)
+centralizes completed full-lib and Clippy results, production-ingress coverage
+including original-client TLS 1.2/1.3 combinations, and direct application-fence
+write/flush/shutdown tests. These are not live Gateway/Podman validation. Full executor
+proof, CLI snapshot binding (T5), durable decision history/CAS (full T6), and
+production qualification remain outstanding. Snapshot polling can miss an
+intermediate rejection/reapproval; no durable decision-revocation fence is claimed.

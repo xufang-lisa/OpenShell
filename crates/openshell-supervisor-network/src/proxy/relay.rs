@@ -247,10 +247,11 @@ pub(super) fn prepare_raw_relay(
 /// CONNECT plaintext and TLS-terminated streams both enter through this
 /// function. Forward HTTP will provide a buffered first request to the same
 /// boundary in the next migration step.
-pub(super) async fn relay_http_stream<C, U>(
+pub(super) async fn relay_http_stream_with_resume<C, U>(
     client: C,
     mut upstream: U,
     context: RelayContext<'_>,
+    resume: Option<(&super::held::ResumeEnvironment, bool)>,
 ) -> Result<()>
 where
     C: AsyncRead + AsyncWrite + Unpin + Send,
@@ -265,14 +266,31 @@ where
     match relay_http_stream_in_session(&mut session, &mut upstream, context).await? {
         HttpRelayExit::PendingReview => {
             // Drop old upstream/evaluator before the client begins waiting.
-            // There is no fresh dial, policy re-entry, or write in this slice.
             drop(upstream);
-            let _ = session.wait_no_release().await;
+            if let Some((environment, tls)) = resume {
+                super::held::resume_after_review(&mut session, environment, tls).await?;
+            } else {
+                let _ = session.wait_no_release().await;
+            }
         }
         HttpRelayExit::PolicyChanged => emit_stale_relay_close(request, &guard),
         HttpRelayExit::Finished => {}
     }
     Ok(())
+}
+
+/// Legacy fixtures intentionally retain the no-release adapter.
+#[cfg(test)]
+pub(super) async fn relay_http_stream<C, U>(
+    client: C,
+    upstream: U,
+    context: RelayContext<'_>,
+) -> Result<()>
+where
+    C: AsyncRead + AsyncWrite + Unpin + Send,
+    U: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    relay_http_stream_with_resume(client, upstream, context, None).await
 }
 
 /// Keep client ownership outside the adapter's own cancellation boundary.

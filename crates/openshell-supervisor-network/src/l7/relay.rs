@@ -37,6 +37,9 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tracing::{debug, warn};
 
+mod held;
+pub(crate) use held::relay_held_rest_once;
+
 #[cfg(test)]
 mod token_grant_ownership_tests;
 

@@ -26,6 +26,23 @@ pub struct HeldProposalInput {
 }
 
 impl HeldProposalInput {
+    /// Captured trusted connection identity for the limited MVP, not proof of
+    /// the current executor. Never include argv as an authorization fallback.
+    pub(crate) fn captured_network_input(&self) -> Option<crate::opa::NetworkInput> {
+        let endpoint = self.scope.endpoints.first()?;
+        let [port] = endpoint.ports.as_slice() else {
+            return None;
+        };
+        Some(crate::opa::NetworkInput {
+            host: endpoint.host.clone(),
+            port: u16::try_from(*port).ok()?,
+            binary_path: self.binary.clone().into(),
+            binary_sha256: String::new(),
+            ancestors: self.ancestors.iter().map(Into::into).collect(),
+            cmdline_paths: Vec::new(),
+        })
+    }
+
     /// Observe the installed native policy using captured, not current-executor,
     /// identity. This is coverage evidence only; it cannot authorize execution.
     pub(crate) fn installed_coverage(

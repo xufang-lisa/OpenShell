@@ -26,6 +26,9 @@ pub enum CaptureState {
     Classified,
     /// Bounded no-release wait; this is NOT evidence of a durable proposal.
     PendingReview,
+    /// One frozen request has left review for fresh native admission. This is
+    /// not a forwarding permit and cannot enter the review wait a second time.
+    Readmitting,
     /// Native processing owns the request; no review snapshot is retained.
     Exchanging,
     Terminal,
@@ -39,6 +42,14 @@ pub enum ReviewProgress {
     Pending,
     ApprovedAwaitingCoverage,
     CoveredNoAuthority { generation: u64 },
+}
+
+/// Internal handoff only. Covered retains Q and its quota for fresh admission;
+/// it provides neither full executor identity nor upstream write authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReviewWaitOutcome {
+    Terminal(super::wait::WaitEnd),
+    Covered { generation: u64 },
 }
 
 /// Immutable local capture, including native parser canonicalization.
@@ -153,6 +164,10 @@ impl RequestSlot {
     #[must_use]
     pub fn review_progress(&self) -> ReviewProgress {
         self.review_progress
+    }
+
+    pub(crate) fn held_input(&self) -> Option<&super::proposal::HeldProposalInput> {
+        self.proposal_input.as_ref()
     }
 
     pub(crate) fn set_proposal_input(&mut self, input: super::proposal::HeldProposalInput) {
@@ -286,6 +301,26 @@ impl RequestSlot {
         self.state == CaptureState::PendingReview
     }
 
+    pub(crate) fn resume_fence(&self) -> Option<std::sync::Arc<super::wait::ResumeFence>> {
+        self.waiter
+            .as_ref()
+            .map(super::wait::WaitReservation::resume_fence)
+    }
+
+    /// Recheck at fresh admission; coverage is not a reusable execution grant.
+    pub(crate) fn readmission_guard(
+        &self,
+        generation: u64,
+    ) -> std::result::Result<PolicyGenerationGuard, super::wait::WaitEnd> {
+        if self.state != CaptureState::Readmitting {
+            return Err(super::wait::WaitEnd::PolicyChanged);
+        }
+        self.waiter
+            .as_ref()
+            .ok_or(super::wait::WaitEnd::PolicyChanged)?
+            .readmission_guard(generation)
+    }
+
     pub(crate) fn try_begin_wait(
         &mut self,
         engine: &crate::opa::TunnelPolicyEngine,
@@ -330,7 +365,7 @@ impl RequestSlot {
                 .severity(SeverityId::Informational)
                 .dst_endpoint(Endpoint::from_domain(host, port))
                 .unmapped("request_id", serde_json::json!(self.review_request_id))
-                .message("HTTP_HITL_WAIT admitted; release disabled")
+                .message("HTTP_HITL_WAIT admitted; awaiting review and fresh admission")
                 .build()
         );
         true
@@ -392,11 +427,31 @@ impl<C: tokio::io::AsyncRead> HttpSession<C> {
     where
         C: Unpin,
     {
+        match self.wait_for_review(false).await? {
+            ReviewWaitOutcome::Terminal(reason) => Some(reason),
+            ReviewWaitOutcome::Covered { .. } => unreachable!("legacy wait never resumes"),
+        }
+    }
+
+    /// Limited MVP handoff using captured trusted connection identity for ONE
+    /// frozen request. Current-executor lifecycle proof is explicitly deferred;
+    /// callers must not invent a fresh/full identity from proposal metadata.
+    pub(crate) async fn wait_for_approval(&mut self) -> Option<ReviewWaitOutcome>
+    where
+        C: Unpin,
+    {
+        self.wait_for_review(true).await
+    }
+
+    async fn wait_for_review(&mut self, allow_readmission: bool) -> Option<ReviewWaitOutcome>
+    where
+        C: Unpin,
+    {
         if !self.slot.is_waiting() {
             return None;
         }
         let waiter = self.slot.waiter.as_ref()?;
-        let reason = 'waiting: {
+        let outcome = 'waiting: {
             if self.slot.submitted_proposal.is_none()
                 && let (Some(service), Some(input)) =
                     (waiter.proposal_service(), self.slot.proposal_input.as_ref())
@@ -419,14 +474,16 @@ impl<C: tokio::io::AsyncRead> HttpSession<C> {
                 tokio::select! {
                     biased;
                     reason = waiter.wait(&mut self.client) => {
-                        break 'waiting reason;
+                        break 'waiting ReviewWaitOutcome::Terminal(reason);
                     }
                     chunk_id = submission => {
                         self.slot.submitted_proposal = chunk_id;
                     }
                 }
                 if self.slot.submitted_proposal.is_none() {
-                    break 'waiting super::wait::WaitEnd::ProposalUnavailable;
+                    break 'waiting ReviewWaitOutcome::Terminal(
+                        super::wait::WaitEnd::ProposalUnavailable,
+                    );
                 }
                 ocsf_emit!(
                     NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
@@ -438,7 +495,7 @@ impl<C: tokio::io::AsyncRead> HttpSession<C> {
                         ))
                         .unmapped("request_id", serde_json::json!(self.slot.review_request_id))
                         .unmapped("chunk_id", serde_json::json!(self.slot.submitted_proposal))
-                        .message("HTTP_HITL_PROPOSAL accepted; release disabled")
+                        .message("HTTP_HITL_PROPOSAL accepted; awaiting review and fresh admission")
                         .build()
                 );
             }
@@ -456,10 +513,14 @@ impl<C: tokio::io::AsyncRead> HttpSession<C> {
                         let guard = waiter.policy_guard();
                         let next = match service.observe(input.workspace(), chunk_id).await {
                             Ok(ReviewDecision::Rejected) => {
-                                break super::wait::WaitEnd::ProposalRejected;
+                                break ReviewWaitOutcome::Terminal(
+                                    super::wait::WaitEnd::ProposalRejected,
+                                );
                             }
                             Err(ProposalSubmitError::Unavailable) => {
-                                break super::wait::WaitEnd::ProposalUnavailable;
+                                break ReviewWaitOutcome::Terminal(
+                                    super::wait::WaitEnd::ProposalUnavailable,
+                                );
                             }
                             Ok(ReviewDecision::Approved) => waiter
                                 .installed_coverage(input, frozen)
@@ -483,9 +544,19 @@ impl<C: tokio::io::AsyncRead> HttpSession<C> {
                                     ))
                                     .unmapped("request_id", serde_json::json!(request_id))
                                     .unmapped("chunk_id", serde_json::json!(chunk_id))
-                                    .message(format!("HTTP_HITL_REVIEW state={next:?}; no release"))
+                                    .message(format!("HTTP_HITL_REVIEW state={next:?}; observation is not execution authority"))
                                     .build()
                             );
+                        }
+                        if let ReviewProgress::CoveredNoAuthority { generation } = next {
+                            break if allow_readmission {
+                                match waiter.readmission_guard(generation) {
+                                    Ok(_) => ReviewWaitOutcome::Covered { generation },
+                                    Err(reason) => ReviewWaitOutcome::Terminal(reason),
+                                }
+                            } else {
+                                ReviewWaitOutcome::Terminal(waiter.readmission_end(generation))
+                            };
                         }
                         // Configuration installation wakes coverage observation;
                         // timer fallback handles lost notices and ledger changes.
@@ -504,12 +575,17 @@ impl<C: tokio::io::AsyncRead> HttpSession<C> {
                 };
                 tokio::select! {
                     biased;
-                    reason = waiter.wait(&mut self.client) => reason,
-                    reason = observation => reason,
+                    reason = waiter.wait(&mut self.client) => ReviewWaitOutcome::Terminal(reason),
+                    outcome = observation => outcome,
                 }
             } else {
-                waiter.wait(&mut self.client).await
+                ReviewWaitOutcome::Terminal(waiter.wait(&mut self.client).await)
             }
+        };
+        let ReviewWaitOutcome::Terminal(reason) = outcome else {
+            // Do not clear Q, drop quota or leave another resumable waiter.
+            self.slot.state = CaptureState::Readmitting;
+            return Some(outcome);
         };
         let (host, port) = waiter.destination();
         ocsf_emit!(
@@ -523,7 +599,7 @@ impl<C: tokio::io::AsyncRead> HttpSession<C> {
                 .build()
         );
         self.slot.terminate();
-        Some(reason)
+        Some(outcome)
     }
 
     /// Borrow without unwrapping the reader or replacing the client TLS object.

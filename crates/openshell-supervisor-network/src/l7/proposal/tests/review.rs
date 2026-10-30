@@ -130,7 +130,7 @@ fn http_hitl_coverage_uses_actual_port_not_source_legacy_first_port() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn http_hitl_approved_then_installed_is_covered_without_authority_and_revocable() {
+async fn http_hitl_readmission_approved_then_covered_fails_closed_without_executor() {
     let engine = Arc::new(OpaEngine::from_strings(POLICY, DATA).unwrap());
     engine.set_http_hitl_wait_enabled(true);
     engine.attach_http_hitl_policy_observer();
@@ -156,22 +156,21 @@ async fn http_hitl_approved_then_installed_is_covered_without_authority_and_revo
     engine
         .reload(POLICY, &DATA.replace("path: /allowed", "path: /missing"))
         .unwrap();
-    tick(&mut session).await;
     assert_eq!(
-        session.slot().review_progress(),
-        ReviewProgress::CoveredNoAuthority { generation: 2 }
+        session.wait_no_release().await,
+        Some(WaitEnd::CurrentExecutorUnavailable)
     );
-    assert_eq!(session.slot().state(), CaptureState::PendingReview);
-    assert_eq!(engine.http_hitl_wait_runtime().population(), 1);
-    engine.reload(POLICY, DATA).unwrap();
-    tick(&mut session).await;
-    assert_eq!(
-        session.slot().review_progress(),
-        ReviewProgress::ApprovedAwaitingCoverage
-    );
-    advance(Duration::from_secs(299)).await;
-    assert_eq!(session.wait_no_release().await, Some(WaitEnd::Deadline));
+    assert_eq!(session.slot().state(), CaptureState::Terminal);
+    assert!(session.slot().frozen().is_none());
     assert_eq!(session.slot().review_progress(), ReviewProgress::Unknown);
+    assert_eq!(engine.http_hitl_wait_runtime().population(), 1);
+    // Neither policy changes nor late approval can revive the old request.
+    engine.reload(POLICY, DATA).unwrap();
+    engine
+        .reload(POLICY, &DATA.replace("path: /allowed", "path: /missing"))
+        .unwrap();
+    advance(Duration::from_secs(299)).await;
+    assert_eq!(session.wait_no_release().await, None);
     assert_eq!(engine.http_hitl_wait_runtime().population(), 1);
     drop(session);
     assert_eq!(engine.http_hitl_wait_runtime().population(), 0);
@@ -181,8 +180,92 @@ async fn http_hitl_approved_then_installed_is_covered_without_authority_and_revo
         .unwrap();
     assert!(
         bytes.is_empty(),
-        "approval/coverage never writes a response or upstream HTTP"
+        "unavailable executor never writes a response or upstream HTTP"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn http_hitl_readmission_requires_approved_not_just_a_covering_reload() {
+    let engine = Arc::new(OpaEngine::from_strings(POLICY, DATA).unwrap());
+    engine.set_http_hitl_wait_enabled(true);
+    engine.attach_http_hitl_policy_observer();
+    let reviewer = Arc::new(Reviewer::new(ReviewDecision::Pending));
+    engine.set_http_hitl_proposal_service(reviewer.clone());
+    let (_client, mut session) = held(&engine);
+    tick(&mut session).await;
+    engine
+        .reload(POLICY, &DATA.replace("path: /allowed", "path: /missing"))
+        .unwrap();
+    tick(&mut session).await;
+    assert_eq!(session.slot().review_progress(), ReviewProgress::Pending);
+    *reviewer.decision.lock().unwrap() = ReviewDecision::Unknown;
+    advance(Duration::from_secs(1)).await;
+    tick(&mut session).await;
+    assert_eq!(session.slot().review_progress(), ReviewProgress::Unknown);
+    assert_eq!(session.slot().state(), CaptureState::PendingReview);
+    *reviewer.decision.lock().unwrap() = ReviewDecision::Rejected;
+    assert_eq!(
+        session.wait_no_release().await,
+        Some(WaitEnd::ProposalRejected)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn http_hitl_readmission_without_coverage_preserves_original_deadline() {
+    let engine = Arc::new(OpaEngine::from_strings(POLICY, DATA).unwrap());
+    engine.set_http_hitl_wait_enabled(true);
+    engine.attach_http_hitl_policy_observer();
+    engine.set_http_hitl_proposal_service(Arc::new(Reviewer::new(ReviewDecision::Approved)));
+    let (_client, mut session) = held(&engine);
+    tick(&mut session).await;
+    advance(Duration::from_secs(299)).await;
+    engine.reload(POLICY, DATA).unwrap();
+    tick(&mut session).await;
+    assert_eq!(
+        session.slot().review_progress(),
+        ReviewProgress::ApprovedAwaitingCoverage
+    );
+    advance(Duration::from_secs(1)).await;
+    assert_eq!(session.wait_no_release().await, Some(WaitEnd::Deadline));
+    assert_eq!(engine.http_hitl_wait_runtime().population(), 1);
+    drop(session);
+    assert_eq!(engine.http_hitl_wait_runtime().population(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn http_hitl_readmission_terminal_transport_or_deadline_wins_over_coverage() {
+    for mode in 0..3 {
+        let engine = Arc::new(OpaEngine::from_strings(POLICY, DATA).unwrap());
+        engine.set_http_hitl_wait_enabled(true);
+        engine.attach_http_hitl_policy_observer();
+        let reviewer = Arc::new(Reviewer::new(ReviewDecision::Pending));
+        engine.set_http_hitl_proposal_service(reviewer.clone());
+        let (mut client, mut session) = held(&engine);
+        tick(&mut session).await;
+        *reviewer.decision.lock().unwrap() = ReviewDecision::Approved;
+        engine
+            .reload(POLICY, &DATA.replace("path: /allowed", "path: /missing"))
+            .unwrap();
+        let expected = match mode {
+            0 => {
+                client.shutdown().await.unwrap();
+                WaitEnd::ClientClosed
+            }
+            1 => {
+                client.write_all(b"extra").await.unwrap();
+                WaitEnd::ExtraInput
+            }
+            _ => {
+                advance(Duration::from_mins(5)).await;
+                WaitEnd::Deadline
+            }
+        };
+        assert_eq!(session.wait_no_release().await, Some(expected));
+        assert_eq!(session.slot().state(), CaptureState::Terminal);
+        assert_eq!(engine.http_hitl_wait_runtime().population(), 1);
+        drop(session);
+        assert_eq!(engine.http_hitl_wait_runtime().population(), 0);
+    }
 }
 
 #[tokio::test(start_paused = true)]

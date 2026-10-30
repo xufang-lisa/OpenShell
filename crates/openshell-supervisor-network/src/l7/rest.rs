@@ -666,7 +666,7 @@ fn is_http_field_value_byte(byte: u8) -> bool {
 /// Rebuild the request line in a raw HTTP header block with a canonicalized
 /// target. Called when the canonical path differs from what the client sent,
 /// so the upstream dispatches on the exact bytes the policy engine evaluated.
-fn rewrite_request_line_target(
+pub(crate) fn rewrite_request_line_target(
     raw: &[u8],
     method: &str,
     canonical_path: &str,

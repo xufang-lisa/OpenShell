@@ -6,6 +6,7 @@
 mod capture;
 pub(crate) mod destination;
 mod egress;
+mod held;
 mod relay;
 #[cfg(test)]
 pub(crate) use relay::relay_inspected_http_stream_for_test;
@@ -2436,6 +2437,20 @@ async fn handle_mediated_connection(
     endpoint_observation_tx: Option<EndpointObservationSender>,
     required_proxy_authorization: Option<Arc<str>>,
 ) -> Result<()> {
+    let held_environment = held::ResumeEnvironment {
+        engine: opa_engine.clone(),
+        entrypoint_pid: entrypoint_pid.clone(),
+        backend_host_gateway: backend_host_gateway.clone(),
+        trusted_host_gateway: trusted_host_gateway.clone(),
+        upstream_proxy: upstream_proxy.clone(),
+        tls_state: tls_state.clone(),
+        policy_local_ctx: policy_local_ctx.clone(),
+        provider_credentials: provider_credentials.clone(),
+        secret_resolver: secret_resolver.clone(),
+        agent_proposals: agent_proposals.clone(),
+        activity: activity_tx.clone(),
+        endpoint_observation: endpoint_observation_tx.clone(),
+    };
     // Bind observations to the policy/provider inventory active when this
     // connection was accepted, even if configuration changes while it runs.
     let endpoint_observation_context = endpoint_observation_tx
@@ -2615,7 +2630,7 @@ async fn handle_mediated_connection(
             // order aborts transport before the reservation is released.
             let mut session =
                 crate::l7::session::HttpSession::from_reader(client, first_request_slot);
-            let _ = session.wait_no_release().await;
+            held::resume_after_review(&mut session, &held_environment, false).await?;
         }
         return result;
     }
@@ -3132,10 +3147,11 @@ async fn handle_mediated_connection(
                     return Ok(());
                 };
 
-                Box::pin(relay::relay_http_stream(
+                Box::pin(relay::relay_http_stream_with_resume(
                     tls_client,
                     tls_upstream,
                     relay_context,
+                    Some((&held_environment, true)),
                 ))
                 .await
             };
@@ -3210,7 +3226,14 @@ async fn handle_mediated_connection(
         else {
             return Ok(());
         };
-        if let Err(e) = relay::relay_http_stream(client, upstream, relay_context).await {
+        if let Err(e) = relay::relay_http_stream_with_resume(
+            client,
+            upstream,
+            relay_context,
+            Some((&held_environment, false)),
+        )
+        .await
+        {
             if is_benign_relay_error(&e) {
                 if is_l7_relay {
                     debug!(host = %host_lc, port = port, error = %e, "L7 connection closed");

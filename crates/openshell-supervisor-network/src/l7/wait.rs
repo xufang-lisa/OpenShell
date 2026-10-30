@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Bounded, no-release HTTP waiting. There is deliberately no write permission,
-//! background poller or resumable upstream in this module.
+//! Bounded HTTP waiting and original-lifetime fences. Neither coverage nor a
+//! fence supplies identity, routing, credentials or upstream write permission.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
@@ -23,6 +23,11 @@ pub enum WaitEnd {
     ProposalUnavailable,
     /// Authoritative ledger rejection, not an assertion about its actor.
     ProposalRejected,
+    /// Coverage became stale before entering fresh admission. Never reconnect.
+    PolicyChanged,
+    /// No backend currently proves executor continuity through first write.
+    /// Connection-time identity, procfs resampling and TOFU are insufficient.
+    CurrentExecutorUnavailable,
 }
 
 struct Population {
@@ -176,8 +181,13 @@ impl WaitRuntime {
         Some(WaitReservation {
             runtime: self.clone(),
             key,
-            epoch: state.epoch,
             deadline,
+            resume_fence: Arc::new(ResumeFence {
+                runtime: self.clone(),
+                epoch: state.epoch,
+                deadline,
+                started: watch::channel(false).0,
+            }),
         })
     }
 
@@ -202,11 +212,117 @@ impl Drop for WaitShutdown {
 pub struct WaitReservation {
     runtime: Arc<WaitRuntime>,
     key: (String, u16),
+    deadline: Instant,
+    resume_fence: Arc<ResumeFence>,
+}
+
+/// Shared cancellation fence, cloned from the original reservation. It owns no
+/// quota: the session must retain its reservation until after transport drop.
+/// Captured trusted connection identity is an explicitly limited MVP; this is
+/// NOT proof of current-executor continuity across exec or FD transfer.
+pub struct ResumeFence {
+    runtime: Arc<WaitRuntime>,
     epoch: u64,
     deadline: Instant,
+    // A watch retains the value even if mark_started precedes subscription or
+    // races the select. No notification can be lost between check and await.
+    started: watch::Sender<bool>,
+}
+
+impl ResumeFence {
+    fn terminal_reason(&self, enforce_deadline: bool) -> Option<WaitEnd> {
+        self.runtime
+            .population
+            .lock()
+            .map_or(Some(WaitEnd::Shutdown), |state| {
+                if state.epoch != self.epoch
+                    || state.shutdown
+                    || state.quarantined
+                    || !state.enabled
+                {
+                    Some(state.last_terminal)
+                } else if enforce_deadline && Instant::now() >= self.deadline {
+                    Some(WaitEnd::Deadline)
+                } else {
+                    None
+                }
+            })
+    }
+
+    /// Call immediately before each application `poll_write` until a positive
+    /// write. Pending, zero writes and transport/TLS setup do not start HTTP.
+    pub(crate) fn check(&self) -> Result<(), WaitEnd> {
+        self.terminal_reason(!*self.started.borrow())
+            .map_or(Ok(()), Err)
+    }
+
+    /// Call ONLY after an actual positive HTTP application `poll_write`. This
+    /// disables the capture deadline, never runtime/epoch cancellation.
+    pub(crate) fn mark_started(&self) {
+        self.started.send_replace(true);
+    }
+
+    pub(crate) fn has_started(&self) -> bool {
+        *self.started.borrow()
+    }
+
+    pub(crate) async fn wait_cancelled(&self) -> WaitEnd {
+        let mut changed = self.runtime.changed.subscribe();
+        let mut started = self.started.subscribe();
+        loop {
+            let enforce_deadline = !*started.borrow_and_update();
+            if let Some(reason) = self.terminal_reason(enforce_deadline) {
+                return reason;
+            }
+            tokio::select! {
+                biased;
+                result = changed.changed() => {
+                    if result.is_err() { return WaitEnd::Shutdown; }
+                }
+                result = started.changed() => {
+                    if result.is_err() { return WaitEnd::Shutdown; }
+                }
+                () = tokio::time::sleep_until(self.deadline), if enforce_deadline => {}
+            }
+        }
+    }
 }
 
 impl WaitReservation {
+    /// Original lifetime remains mandatory at the readmission boundary.
+    fn terminal_reason(&self) -> Option<WaitEnd> {
+        self.resume_fence.terminal_reason(true)
+    }
+
+    pub(crate) fn resume_fence(&self) -> Arc<ResumeFence> {
+        self.resume_fence.clone()
+    }
+
+    /// Validate original lifetime and the installed coverage generation. This
+    /// does not manufacture a full identity or replace fresh native admission.
+    /// Current-executor lifecycle proof is explicitly deferred for the MVP.
+    pub(crate) fn readmission_guard(
+        &self,
+        coverage_generation: u64,
+    ) -> Result<crate::opa::PolicyGenerationGuard, WaitEnd> {
+        if let Some(reason) = self.terminal_reason() {
+            return Err(reason);
+        }
+        let guard = self.policy_guard().ok_or(WaitEnd::PolicyChanged)?;
+        if guard.captured_generation() != coverage_generation || guard.is_stale() {
+            return Err(WaitEnd::PolicyChanged);
+        }
+        Ok(guard)
+    }
+
+    /// Legacy no-release adapter deliberately never grants resume authority.
+    pub(crate) fn readmission_end(&self, coverage_generation: u64) -> WaitEnd {
+        match self.readmission_guard(coverage_generation) {
+            Ok(_) => WaitEnd::CurrentExecutorUnavailable,
+            Err(reason) => reason,
+        }
+    }
+
     pub(crate) fn policy_guard(&self) -> Option<crate::opa::PolicyGenerationGuard> {
         let engine = self.runtime.policy_engine.lock().ok()?.upgrade()?;
         engine.generation_guard(engine.current_generation()).ok()
@@ -232,18 +348,7 @@ impl WaitReservation {
     pub(crate) async fn wait<C: AsyncRead + Unpin>(&self, client: &mut BufReader<C>) -> WaitEnd {
         let mut changed = self.runtime.changed.subscribe();
         loop {
-            let terminal =
-                self.runtime
-                    .population
-                    .lock()
-                    .map_or(Some(WaitEnd::Shutdown), |state| {
-                        (state.epoch != self.epoch
-                            || state.shutdown
-                            || state.quarantined
-                            || !state.enabled)
-                            .then_some(state.last_terminal)
-                    });
-            if let Some(reason) = terminal {
+            if let Some(reason) = self.terminal_reason() {
                 return reason;
             }
             tokio::select! {
@@ -275,6 +380,9 @@ impl Drop for WaitReservation {
         }
     }
 }
+
+#[cfg(test)]
+mod readmission_tests;
 
 #[cfg(test)]
 mod tests {

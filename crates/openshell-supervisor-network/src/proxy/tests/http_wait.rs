@@ -8,6 +8,18 @@ use futures::poll;
 struct HeldIntentRecorder(std::sync::Mutex<Vec<String>>);
 
 impl crate::l7::proposal::HeldProposalService for HeldIntentRecorder {
+    fn observe<'a>(
+        &'a self,
+        workspace: &'a str,
+        chunk_id: &'a str,
+    ) -> crate::l7::proposal::ProposalObservation<'a> {
+        Box::pin(async move {
+            assert_eq!(workspace, "fixture-team");
+            assert_eq!(chunk_id, "durable-fixture-chunk");
+            Ok(crate::l7::proposal::ReviewDecision::Approved)
+        })
+    }
+
     fn submit<'a>(
         &'a self,
         input: &'a crate::l7::proposal::HeldProposalInput,
@@ -70,6 +82,7 @@ network_policies:
                     .unwrap(),
             );
             engine.set_http_hitl_wait_enabled(true);
+            engine.attach_http_hitl_policy_observer();
             let recorder = Arc::new(HeldIntentRecorder::default());
             engine.set_http_hitl_proposal_service(recorder.clone());
             let cache = Arc::new(BinaryIdentityCache::new());
@@ -175,6 +188,18 @@ network_policies:
                 .unwrap();
             assert!(poll!(handler.as_mut()).is_pending());
             assert_eq!(engine.http_hitl_wait_runtime().population(), 1);
+            engine
+                .reload(
+                    include_str!("../../../data/sandbox-policy.rego"),
+                    &data.replace("path: /allowed", "path: /missing"),
+                )
+                .unwrap();
+            assert!(poll!(handler.as_mut()).is_pending());
+            {
+                let accept = listener.accept();
+                tokio::pin!(accept);
+                assert!(poll!(accept.as_mut()).is_pending(), "approved and covered CONNECT must not reconnect upstream");
+            }
             engine.enter_fail_closed("CONNECT wait test").unwrap();
             handler.await.unwrap();
             assert_eq!(engine.http_hitl_wait_runtime().population(), 0);
@@ -213,6 +238,7 @@ network_policies:
                 .unwrap(),
         );
         engine.set_http_hitl_wait_enabled(true);
+        engine.attach_http_hitl_policy_observer();
         let recorder = Arc::new(HeldIntentRecorder::default());
         engine.set_http_hitl_proposal_service(recorder.clone());
         let identity = ContractBinaryIdentity {
@@ -269,6 +295,13 @@ network_policies:
             .unwrap();
         assert!(poll!(handler.as_mut()).is_pending());
         assert_eq!(engine.http_hitl_wait_runtime().population(), 1);
+        engine
+            .reload(
+                include_str!("../../../data/sandbox-policy.rego"),
+                &data.replace("path: /allowed", "path: /missing"),
+            )
+            .unwrap();
+        assert!(poll!(handler.as_mut()).is_pending());
         {
             let accept = upstream.accept();
             tokio::pin!(accept);

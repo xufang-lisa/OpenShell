@@ -2,19 +2,21 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Bounded, cancellation-owned submission of pending human-review proposals.
-//! This service neither reads decisions nor authorizes request forwarding.
+//! Submission and coalesced read-only decision observation never authorize forwarding.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::time::Duration;
 
 use openshell_core::grpc_client::CachedOpenShellClient;
 use openshell_core::proposals::{HTTP_HITL_ANALYSIS_MODE, http_hitl_submission_fingerprint};
 use openshell_core::proto::{
-    PolicyChunk, SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse,
+    GetDraftPolicyRequest, GetDraftPolicyResponse, PolicyChunk, SubmitPolicyAnalysisRequest,
+    SubmitPolicyAnalysisResponse,
 };
 use openshell_supervisor_network::l7::proposal::{
-    HeldProposalInput, HeldProposalService, ProposalSubmission, ProposalSubmitError,
+    HeldProposalInput, HeldProposalService, ProposalObservation, ProposalSubmission,
+    ProposalSubmitError, ReviewDecision,
 };
 use tokio::sync::{Mutex, watch};
 use tokio::time::{Instant, sleep_until, timeout};
@@ -22,6 +24,16 @@ use tokio::time::{Instant, sleep_until, timeout};
 const RPC_TIMEOUT: Duration = Duration::from_secs(10);
 const ATTEMPT_INTERVAL: Duration = Duration::from_secs(1);
 const CACHE_CAPACITY: usize = 16;
+// Bound the existing all-drafts RPC without adding a new public API. Oversized
+// ledgers fail closed; never accept a truncated response as a complete snapshot.
+const REVIEW_RESPONSE_BYTES: usize = 256 * 1024;
+const REVIEW_CHUNKS: usize = 1024;
+
+struct ReviewState {
+    next_attempt: Instant,
+    workspace: String,
+    snapshot: Option<HashMap<String, ReviewDecision>>,
+}
 
 struct SubmissionState {
     next_attempt: Instant,
@@ -34,6 +46,7 @@ pub struct ProposalService {
     workspace_rx: watch::Receiver<String>,
     session_id: uuid::Uuid,
     state: Mutex<SubmissionState>,
+    review: Mutex<ReviewState>,
 }
 
 impl ProposalService {
@@ -51,6 +64,11 @@ impl ProposalService {
                 next_attempt: Instant::now(),
                 accepted: VecDeque::with_capacity(CACHE_CAPACITY),
             }),
+            review: Mutex::new(ReviewState {
+                next_attempt: Instant::now(),
+                workspace: String::new(),
+                snapshot: None,
+            }),
         }
     }
 
@@ -59,6 +77,61 @@ impl ProposalService {
             return Err(ProposalSubmitError::Unavailable);
         }
         Ok(())
+    }
+
+    // Cooperative coordinator: all active waiters share one bounded batch
+    // snapshot and at most one read RPC per second. No task survives its owner.
+    async fn observe_candidate<F, Fut>(
+        &self,
+        workspace: &str,
+        chunk_id: &str,
+        fetch: F,
+    ) -> Result<ReviewDecision, ProposalSubmitError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<GetDraftPolicyResponse, ProposalSubmitError>>,
+    {
+        self.check_workspace(workspace)?;
+        let mut state = self.review.lock().await;
+        self.check_workspace(workspace)?;
+        if state.workspace != workspace {
+            state.snapshot = None;
+            state.workspace = workspace.to_string();
+        }
+        if Instant::now() >= state.next_attempt {
+            state.next_attempt = Instant::now() + ATTEMPT_INTERVAL;
+            // Cancel/error cannot leave a previous approval looking current.
+            state.snapshot = None;
+            let response = timeout(RPC_TIMEOUT, fetch()).await;
+            // Share even a slow fetch/error with queued waiters instead of
+            // issuing one back-to-back RPC for each of them on completion.
+            state.next_attempt = Instant::now() + ATTEMPT_INTERVAL;
+            self.check_workspace(workspace)?;
+            let response = response.map_err(|_| ProposalSubmitError::Retryable)??;
+            if response.chunks.len() > REVIEW_CHUNKS {
+                return Err(ProposalSubmitError::Unavailable);
+            }
+            let mut snapshot = HashMap::with_capacity(response.chunks.len());
+            for chunk in response.chunks {
+                let decision = match chunk.status.as_str() {
+                    "pending" => ReviewDecision::Pending,
+                    "approved" => ReviewDecision::Approved,
+                    "rejected" => ReviewDecision::Rejected,
+                    _ => ReviewDecision::Unknown,
+                };
+                if chunk.id.is_empty() || snapshot.insert(chunk.id, decision).is_some() {
+                    return Err(ProposalSubmitError::Unavailable);
+                }
+            }
+            state.snapshot = Some(snapshot);
+        }
+        self.check_workspace(workspace)?;
+        Ok(state
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.get(chunk_id))
+            .copied()
+            .unwrap_or(ReviewDecision::Unknown))
     }
 
     // The injected operation keeps tests independent of the private network
@@ -103,6 +176,28 @@ impl ProposalService {
 }
 
 impl HeldProposalService for ProposalService {
+    fn observe<'a>(&'a self, workspace: &'a str, chunk_id: &'a str) -> ProposalObservation<'a> {
+        Box::pin(
+            self.observe_candidate(workspace, chunk_id, move || async move {
+                let result = CachedOpenShellClient::connect(&self.endpoint).await;
+                self.check_workspace(workspace)?;
+                let client = result.map_err(classify_gateway_error)?;
+                client.set_workspace(workspace.to_string());
+                client
+                    .raw_client()
+                    .max_decoding_message_size(REVIEW_RESPONSE_BYTES)
+                    .get_draft_policy(GetDraftPolicyRequest {
+                        sandbox: self.sandbox_name.clone(),
+                        workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
+                        status_filter: String::new(),
+                    })
+                    .await
+                    .map(tonic::Response::into_inner)
+                    .map_err(|status| classify_status(status.code()))
+            }),
+        )
+    }
+
     fn submit<'a>(&'a self, input: &'a HeldProposalInput) -> ProposalSubmission<'a> {
         Box::pin(async move {
             self.check_workspace(input.workspace())?;

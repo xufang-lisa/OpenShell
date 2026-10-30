@@ -26,6 +26,83 @@ pub struct HeldProposalInput {
 }
 
 impl HeldProposalInput {
+    /// Observe the installed native policy using captured, not current-executor,
+    /// identity. This is coverage evidence only; it cannot authorize execution.
+    pub(crate) fn installed_coverage(
+        &self,
+        engine: &crate::opa::OpaEngine,
+        frozen: &FrozenRequest,
+    ) -> Option<u64> {
+        use crate::opa::{NetworkAction, NetworkInput};
+        let endpoint = self.scope.endpoints.first()?;
+        // Extraction narrows `ports` to the actual held destination; legacy
+        // `port` may still describe the first port of the original endpoint.
+        let [port] = endpoint.ports.as_slice() else {
+            return None;
+        };
+        let port = u16::try_from(*port).ok()?;
+        let authorization = engine
+            .authorize_egress(&NetworkInput {
+                host: endpoint.host.clone(),
+                port,
+                binary_path: self.binary.clone().into(),
+                binary_sha256: String::new(),
+                ancestors: self.ancestors.iter().map(Into::into).collect(),
+                cmdline_paths: Vec::new(),
+            })
+            .ok()?;
+        if !matches!(authorization.action, NetworkAction::Allow { .. })
+            || !authorization.endpoint_configs.iter().any(|value| {
+                super::parse_l7_config(value).is_some_and(|config| {
+                    config.protocol == super::L7Protocol::Rest
+                        && config.enforcement == super::EnforcementMode::Enforce
+                })
+            })
+        {
+            return None;
+        }
+        let tunnel = engine
+            .clone_engine_for_tunnel(authorization.generation)
+            .ok()?;
+        let ctx = L7EvalContext {
+            host: endpoint.host.clone(),
+            port,
+            workspace: self.workspace.clone(),
+            request_default_port: None,
+            policy_name: String::new(),
+            binary_path: self.binary.clone(),
+            ancestors: self.ancestors.clone(),
+            cmdline_paths: Vec::new(),
+            secret_resolver: None,
+            provider_credentials: None,
+            provider_credential_revision: None,
+            provider_credential_installation_id: None,
+            body_classifier: None,
+            activity_tx: None,
+            token_grant_resolver: None,
+            agent_proposals: openshell_core::proposals::AgentProposals::default(),
+            endpoint_observation_tx: None,
+        };
+        let request = frozen.request();
+        let decision = super::hitl::evaluate_l7_request_classified(
+            &tunnel,
+            &ctx,
+            &super::L7RequestInfo {
+                action: request.action.clone(),
+                target: request.target.clone(),
+                query_params: request.query_params.clone(),
+                graphql: None,
+                jsonrpc: None,
+            },
+        )
+        .ok()?;
+        (decision.allowed
+            && decision.l4_allowed
+            && decision.binary_identity_required
+            && !tunnel.is_stale())
+        .then_some(authorization.generation)
+    }
+
     #[must_use]
     pub fn scope(&self) -> &NetworkPolicyRule {
         &self.scope
@@ -75,9 +152,28 @@ pub enum ProposalSubmitError {
 pub type ProposalSubmission<'a> =
     Pin<Box<dyn Future<Output = Result<String, ProposalSubmitError>> + Send + 'a>>;
 
+/// Gateway ledger observation, not proof of installation or human attribution.
+/// In particular, legacy/system rejection must not be described as a human act.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewDecision {
+    Unknown,
+    Pending,
+    Approved,
+    Rejected,
+}
+
+pub type ProposalObservation<'a> =
+    Pin<Box<dyn Future<Output = Result<ReviewDecision, ProposalSubmitError>> + Send + 'a>>;
+
 /// Implemented by the supervisor composition layer, not by a workload API.
 pub trait HeldProposalService: Send + Sync {
     fn submit<'a>(&'a self, input: &'a HeldProposalInput) -> ProposalSubmission<'a>;
+
+    /// Implementations coalesce sandbox-wide reads; never mutate policy here.
+    /// The default preserves submit-only adapters without inventing decisions.
+    fn observe<'a>(&'a self, _workspace: &'a str, _chunk_id: &'a str) -> ProposalObservation<'a> {
+        Box::pin(async { Ok(ReviewDecision::Unknown) })
+    }
 }
 
 fn literal_binary(path: &str) -> bool {

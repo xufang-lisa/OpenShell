@@ -1081,6 +1081,7 @@ pub async fn run_sandbox_with_backend(
         openshell_endpoint_for_proxy.as_ref(),
         sandbox_name_for_agg.as_ref().or(sandbox_id.as_ref()),
     ) {
+        engine.attach_http_hitl_policy_observer();
         engine.set_http_hitl_proposal_service(Arc::new(http_hitl::ProposalService::new(
             endpoint.clone(),
             name.clone(),

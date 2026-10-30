@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Bounded, no-release HTTP waiting. There is deliberately no write permission,
-//! approval consumer, background poller, or resumable upstream in this module.
+//! background poller or resumable upstream in this module.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::sync::watch;
@@ -21,6 +21,8 @@ pub enum WaitEnd {
     Quarantined,
     Shutdown,
     ProposalUnavailable,
+    /// Authoritative ledger rejection, not an assertion about its actor.
+    ProposalRejected,
 }
 
 struct Population {
@@ -38,6 +40,7 @@ struct Population {
 pub struct WaitRuntime {
     population: Mutex<Population>,
     proposal_service: Mutex<Option<Arc<dyn super::proposal::HeldProposalService>>>,
+    policy_engine: Mutex<Weak<crate::opa::OpaEngine>>,
     changed: watch::Sender<u64>,
     budget: Duration,
     sandbox_limit: usize,
@@ -64,6 +67,7 @@ impl WaitRuntime {
         }
         Ok(Self {
             proposal_service: Mutex::new(None),
+            policy_engine: Mutex::new(Weak::new()),
             population: Mutex::new(Population {
                 enabled: false,
                 quarantined: false,
@@ -98,6 +102,13 @@ impl WaitRuntime {
 
     pub(crate) fn proposal_service(&self) -> Option<Arc<dyn super::proposal::HeldProposalService>> {
         self.proposal_service.lock().ok()?.clone()
+    }
+
+    pub(crate) fn set_policy_engine(&self, engine: Weak<crate::opa::OpaEngine>) {
+        *self
+            .policy_engine
+            .lock()
+            .expect("HTTP policy observer lock poisoned") = engine;
     }
 
     pub(crate) fn configure(&self, enabled: bool) {
@@ -196,6 +207,20 @@ pub struct WaitReservation {
 }
 
 impl WaitReservation {
+    pub(crate) fn policy_guard(&self) -> Option<crate::opa::PolicyGenerationGuard> {
+        let engine = self.runtime.policy_engine.lock().ok()?.upgrade()?;
+        engine.generation_guard(engine.current_generation()).ok()
+    }
+
+    pub(crate) fn installed_coverage(
+        &self,
+        input: &super::proposal::HeldProposalInput,
+        frozen: &super::session::FrozenRequest,
+    ) -> Option<u64> {
+        let engine = self.runtime.policy_engine.lock().ok()?.upgrade()?;
+        input.installed_coverage(&engine, frozen)
+    }
+
     pub(crate) fn proposal_service(&self) -> Option<Arc<dyn super::proposal::HeldProposalService>> {
         self.runtime.proposal_service()
     }

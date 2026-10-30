@@ -5,6 +5,8 @@ use super::*;
 use openshell_core::proto::NetworkPolicyRule;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+mod review;
+
 fn service() -> (watch::Sender<String>, ProposalService) {
     let (tx, rx) = watch::channel("workspace-a".to_string());
     (

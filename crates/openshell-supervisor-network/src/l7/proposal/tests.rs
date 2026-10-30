@@ -15,6 +15,8 @@ use std::sync::{
 };
 use tokio::io::AsyncWriteExt;
 
+mod review;
+
 const POLICY: &str = include_str!("../../../data/sandbox-policy.rego");
 const DATA: &str = r"
 network_policies:

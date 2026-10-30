@@ -323,6 +323,12 @@ impl TunnelPolicyEngine {
 }
 
 impl OpaEngine {
+    /// Attach live installed-policy observation without retaining this engine
+    /// through its own wait runtime. Does not enable waiting or forwarding.
+    pub fn attach_http_hitl_policy_observer(self: &Arc<Self>) {
+        self.http_hitl_wait.set_policy_engine(Arc::downgrade(self));
+    }
+
     /// Wire the trusted supervisor's immediate proposal service. This does not
     /// enable waiting or confer any forwarding authority.
     pub fn set_http_hitl_proposal_service(

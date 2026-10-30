@@ -31,6 +31,16 @@ pub enum CaptureState {
     Terminal,
 }
 
+/// Local observation only. Even coverage conveys no current-executor, route,
+/// credential, middleware or first-write authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewProgress {
+    Unknown,
+    Pending,
+    ApprovedAwaitingCoverage,
+    CoveredNoAuthority { generation: u64 },
+}
+
 /// Immutable local capture, including native parser canonicalization.
 pub struct FrozenRequest {
     captured_header: Vec<u8>,
@@ -87,6 +97,7 @@ pub struct RequestSlot {
     proposal_input: Option<super::proposal::HeldProposalInput>,
     submitted_proposal: Option<String>,
     review_request_id: Option<String>,
+    review_progress: ReviewProgress,
 }
 
 impl Default for RequestSlot {
@@ -110,6 +121,7 @@ impl RequestSlot {
             proposal_input: None,
             submitted_proposal: None,
             review_request_id: None,
+            review_progress: ReviewProgress::Unknown,
         }
     }
 
@@ -134,6 +146,13 @@ impl RequestSlot {
     #[must_use]
     pub fn review_request_id(&self) -> Option<&str> {
         self.review_request_id.as_deref()
+    }
+
+    /// Last observation, tagged with the installed generation when covered.
+    /// Never consume this value as a send permit.
+    #[must_use]
+    pub fn review_progress(&self) -> ReviewProgress {
+        self.review_progress
     }
 
     pub(crate) fn set_proposal_input(&mut self, input: super::proposal::HeldProposalInput) {
@@ -339,6 +358,7 @@ impl RequestSlot {
         self.classification = None;
         self.classification_guard = None;
         self.proposal_input = None;
+        self.review_progress = ReviewProgress::Unknown;
         self.state = CaptureState::Terminal;
     }
 }
@@ -422,7 +442,74 @@ impl<C: tokio::io::AsyncRead> HttpSession<C> {
                         .build()
                 );
             }
-            waiter.wait(&mut self.client).await
+            if let (Some(service), Some(input), Some(chunk_id), Some(frozen)) = (
+                waiter.proposal_service(),
+                self.slot.proposal_input.as_ref(),
+                self.slot.submitted_proposal.as_deref(),
+                self.slot.frozen.as_ref(),
+            ) {
+                let progress = &mut self.slot.review_progress;
+                let request_id = self.slot.review_request_id.as_deref();
+                let observation = async {
+                    loop {
+                        use super::proposal::{ProposalSubmitError, ReviewDecision};
+                        let guard = waiter.policy_guard();
+                        let next = match service.observe(input.workspace(), chunk_id).await {
+                            Ok(ReviewDecision::Rejected) => {
+                                break super::wait::WaitEnd::ProposalRejected;
+                            }
+                            Err(ProposalSubmitError::Unavailable) => {
+                                break super::wait::WaitEnd::ProposalUnavailable;
+                            }
+                            Ok(ReviewDecision::Approved) => waiter
+                                .installed_coverage(input, frozen)
+                                .map_or(ReviewProgress::ApprovedAwaitingCoverage, |generation| {
+                                    ReviewProgress::CoveredNoAuthority { generation }
+                                }),
+                            Ok(ReviewDecision::Pending) => ReviewProgress::Pending,
+                            Ok(ReviewDecision::Unknown) | Err(ProposalSubmitError::Retryable) => {
+                                ReviewProgress::Unknown
+                            }
+                        };
+                        if *progress != next {
+                            *progress = next;
+                            ocsf_emit!(
+                                NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                                    .activity(ActivityId::Other)
+                                    .severity(SeverityId::Informational)
+                                    .dst_endpoint(Endpoint::from_domain(
+                                        waiter.destination().0,
+                                        waiter.destination().1
+                                    ))
+                                    .unmapped("request_id", serde_json::json!(request_id))
+                                    .unmapped("chunk_id", serde_json::json!(chunk_id))
+                                    .message(format!("HTTP_HITL_REVIEW state={next:?}; no release"))
+                                    .build()
+                            );
+                        }
+                        // Configuration installation wakes coverage observation;
+                        // timer fallback handles lost notices and ledger changes.
+                        tokio::select! {
+                            biased;
+                            () = async {
+                                if let Some(guard) = guard {
+                                    guard.wait_until_stale().await;
+                                } else {
+                                    std::future::pending::<()>().await;
+                                }
+                            } => {}
+                            () = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                        }
+                    }
+                };
+                tokio::select! {
+                    biased;
+                    reason = waiter.wait(&mut self.client) => reason,
+                    reason = observation => reason,
+                }
+            } else {
+                waiter.wait(&mut self.client).await
+            }
         };
         let (host, port) = waiter.destination();
         ocsf_emit!(

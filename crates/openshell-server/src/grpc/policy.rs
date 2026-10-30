@@ -1155,6 +1155,11 @@ async fn reconcile_pending_chunks_covered_by_policy(
         .map_err(|error| Status::internal(format!("list pending chunks failed: {error}")))?;
     let mut reconciled = 0;
     for chunk in pending {
+        // Held requests still need an explicit human decision, even when a
+        // policy change independently covers their proposed rule.
+        if chunk.rule_name.starts_with(HTTP_HITL_RULE_PREFIX) {
+            continue;
+        }
         let Some(rule) = decode_draft_chunk_rule(&chunk)? else {
             continue;
         };

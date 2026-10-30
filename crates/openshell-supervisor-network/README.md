@@ -33,5 +33,19 @@ Submission runs inside the existing bounded no-release waiter. Locking, RPC and
 retry cannot extend the original deadline or outlive client cancellation. Waiters
 may share a durable chunk, but retain independent IDs, cancellation and quota.
 Transport ownership ends before its quota charge is returned. Accepted proposal
-IDs and terminal events are locally correlated; no approval/coverage consumption,
-fresh execution admission or HTTP release is implemented by this seam.
+IDs and terminal events are locally correlated.
+
+After acceptance, the same owner consumes read-only ledger observations from a
+supervisor-wide coalesced batch reader. Rejected proposals terminate associated
+waiters without inferring an actor from free-form rejection text. Approved
+proposals still require native L4/L7 coverage of the frozen method/path/query and
+captured executable/ancestor scope by the locally installed engine. Installation
+wakes this check; unrelated reloads do not imply coverage. A weak engine reference
+avoids a runtime ownership cycle. The actual narrowed destination port, not the
+source endpoint's legacy first port, is used.
+
+`ReviewProgress::CoveredNoAuthority { generation }` records an observation, never
+a permit. All states continue waiting under the original lifetime and quota;
+policy changes can remove coverage. OCSF events correlate states without request
+bytes, queries, review tokens or rejection text. Fresh executor admission,
+credential preparation and HTTP release remain unimplemented.

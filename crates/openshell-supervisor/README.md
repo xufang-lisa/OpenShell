@@ -79,4 +79,21 @@ auto-approval. These labels do not authenticate supervisor provenance.
 
 Native GET/HEAD, method folding, query and executable-or-ancestor effects are
 explicit in the review rationale. This increment neither changes policy matching
-nor consumes decisions or resumes a held request.
+nor resumes a held request.
+
+The service also reuses authenticated `GetDraftPolicy` for read-only decision
+observation. Active waiter futures cooperatively share one sandbox-wide batch,
+at most one fetch per second (also spaced after slow completions), with a
+ten-second connect/RPC bound, a 256 KiB response bound and a 1024-chunk limit.
+Only IDs and typed ledger statuses are cached; tokens, reasons and candidate
+contents are discarded. Unknown/missing statuses and transient read failures
+cannot grant coverage; permanent failures terminate safely. Cancellation drops
+the owning operation and releases its lock, without detached polling tasks.
+
+Approved is separate from locally installed coverage. Startup attaches a weak
+reference to the live policy engine for coverage-only observations. Held drafts
+are excluded from automatic covered-policy queue rejection, while ordinary
+draft behavior is unchanged. Ledger rejection is deliberately not labelled as
+human attribution, since the current API does not expose a decision actor.
+CLI snapshot binding (T5), durable decision replay refinements (full T6), live
+Podman qualification and request execution are outside this increment.

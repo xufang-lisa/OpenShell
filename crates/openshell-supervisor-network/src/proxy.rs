@@ -6166,6 +6166,21 @@ async fn handle_forward_proxy_in_slot(
             (false, crate::l7::EnforcementMode::Enforce) => "deny",
         };
 
+        let effectively_denied = force_deny
+            || (!allowed && l7_config.config.enforcement == crate::l7::EnforcementMode::Enforce);
+
+        if effectively_denied
+            && !force_deny
+            && crate::l7::relay::should_begin_wait_for_review(
+                &tunnel_engine,
+                slot,
+                &host_lc,
+                port,
+            )
+        {
+            return Ok(());
+        }
+
         {
             let (action_id, disposition_id, severity) = match decision_str {
                 "deny" => (ActionId::Denied, DispositionId::Blocked, SeverityId::Medium),
@@ -6229,14 +6244,6 @@ async fn handle_forward_proxy_in_slot(
                 .message(log_message)
                 .build();
             ocsf_emit!(event);
-        }
-
-        let effectively_denied = force_deny
-            || (!allowed && l7_config.config.enforcement == crate::l7::EnforcementMode::Enforce);
-
-        if effectively_denied && !force_deny && slot.try_begin_wait(&tunnel_engine, &host_lc, port)
-        {
-            return Ok(());
         }
 
         if effectively_denied {

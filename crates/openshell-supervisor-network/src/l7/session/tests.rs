@@ -63,6 +63,59 @@ fn info(request: &L7Request) -> L7RequestInfo {
 }
 
 #[tokio::test]
+async fn wait_admission_takes_precedence_over_terminal_deny_logging() {
+    let (mut wire, client) = tokio::io::duplex(8192);
+    wire.write_all(HEADER).await.unwrap();
+    let mut session = HttpSession::new(client);
+    let provider = RestProvider::default();
+    let engine = std::sync::Arc::new(engine());
+    engine.set_http_hitl_wait_enabled(true);
+    engine.attach_http_hitl_policy_observer();
+    let reviewer = std::sync::Arc::new(ApprovalReviewer(std::sync::Mutex::new(
+        crate::l7::proposal::ReviewDecision::Pending,
+    )));
+    engine.set_http_hitl_proposal_service(reviewer);
+    let tunnel = engine
+        .clone_engine_for_tunnel(engine.current_generation())
+        .unwrap();
+    let guard = tunnel.generation_guard();
+    {
+        let (reader, slot) = session.parts();
+        slot.enable_wait_admission();
+        let request = provider
+            .capture_request(reader, slot)
+            .await
+            .unwrap()
+            .unwrap();
+        let ctx = L7EvalContext {
+            workspace: "team".into(),
+            ..context()
+        };
+        let decision = evaluate_http_l7_request_with_slot(
+            &tunnel,
+            &ctx,
+            &config(),
+            &request,
+            &info(&request),
+            slot,
+        )
+        .unwrap();
+        assert!(!decision.0);
+        assert_eq!(
+            slot.classification(&guard).unwrap().eligibility,
+            RestHitlEligibility::EligibleForReview
+        );
+        assert!(crate::l7::relay::should_begin_wait_for_review(
+            &tunnel,
+            slot,
+            &context().host,
+            context().port,
+        ));
+        assert!(slot.is_waiting());
+    }
+}
+
+#[tokio::test]
 async fn cancellation_mid_header_keeps_prefix_and_native_canonicalization() {
     let (mut wire, client) = tokio::io::duplex(8192);
     let mut session = HttpSession::new(client);

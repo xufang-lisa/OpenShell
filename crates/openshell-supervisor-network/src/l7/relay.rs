@@ -117,6 +117,15 @@ fn request_default_port(ctx: &L7EvalContext) -> Option<u16> {
     ctx.request_default_port
 }
 
+pub(crate) fn should_begin_wait_for_review(
+    engine: &TunnelPolicyEngine,
+    slot: &mut RequestSlot,
+    host: &str,
+    port: u16,
+) -> bool {
+    slot.try_begin_wait(engine, host, port)
+}
+
 fn scoped_context_for_request(
     ctx: &L7EvalContext,
     request: &crate::l7::provider::L7Request,
@@ -1458,6 +1467,14 @@ where
             (false, EnforcementMode::Audit) => "audit",
             (false, EnforcementMode::Enforce) => "deny",
         };
+        if !allowed
+            && !force_deny
+            && config.enforcement == EnforcementMode::Enforce
+            && should_begin_wait_for_review(&engine, slot, &ctx.host, ctx.port)
+        {
+            return Ok(());
+        }
+
         let engine_type = engine_type_for_protocol(config.protocol);
         let protocol_summary =
             l7_protocol_log_summary(graphql_info.as_ref(), jsonrpc_info.as_ref());
@@ -1470,14 +1487,6 @@ where
             &reason,
             protocol_summary.as_deref(),
         );
-
-        if !allowed
-            && !force_deny
-            && config.enforcement == EnforcementMode::Enforce
-            && slot.try_begin_wait(&engine, &ctx.host, ctx.port)
-        {
-            return Ok(());
-        }
 
         if allowed || (config.enforcement == EnforcementMode::Audit && !force_deny) {
             let chain = engine.query_middleware_chain(&middleware_network_input(ctx))?;
@@ -2209,6 +2218,13 @@ where
             (false, EnforcementMode::Enforce, _) => "deny",
         };
 
+        if !allowed
+            && config.enforcement == EnforcementMode::Enforce
+            && should_begin_wait_for_review(engine, slot, &ctx.host, ctx.port)
+        {
+            return Ok(());
+        }
+
         // Log every L7 decision as an OCSF HTTP Activity event.
         // Uses redacted_target (path only, no query params) to avoid logging secrets.
         {
@@ -2242,13 +2258,6 @@ where
                 ))
                 .build();
             ocsf_emit!(event);
-        }
-
-        if !allowed
-            && config.enforcement == EnforcementMode::Enforce
-            && slot.try_begin_wait(engine, &ctx.host, ctx.port)
-        {
-            return Ok(());
         }
 
         if allowed || config.enforcement == EnforcementMode::Audit {

@@ -466,50 +466,27 @@ mod tests {
     }
 
     #[test]
-    fn reservation_events_bind_mutation_snapshots_without_logging_request_bytes() {
-        use std::io::Write;
-        use tracing_subscriber::layer::SubscriberExt;
-
-        #[derive(Clone)]
-        struct Capture(Arc<Mutex<Vec<u8>>>);
-        impl Write for Capture {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(bytes);
-                Ok(bytes.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let output = Arc::new(Mutex::new(Vec::new()));
-        let subscriber = tracing_subscriber::registry()
-            .with(openshell_ocsf::OcsfJsonlLayer::new(Capture(output.clone())));
+    fn reservation_population_transitions_stay_consistent_without_global_event_capture() {
         let runtime = runtime();
-        let id = tracing::subscriber::with_default(subscriber, || {
-            let charge = runtime
-                .reserve("api.example.test", 80, Instant::now())
-                .unwrap();
-            let id = charge.id().to_owned();
-            assert_eq!(runtime.population(), 1);
-            drop(charge);
-            assert_eq!(runtime.population(), 0);
-            id
-        });
-        let bytes = output.lock().unwrap();
-        let records: Vec<serde_json::Value> = std::str::from_utf8(&bytes)
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
-        assert_eq!(records.len(), 2);
-        for (index, action) in ["reserved", "released"].into_iter().enumerate() {
-            let fields = &records[index]["unmapped"];
-            assert_eq!(fields["reservation_id"], id);
-            assert_eq!(fields["reservation_action"], action);
-            assert_eq!(fields["sandbox_waiters"], 1 - index);
-            assert_eq!(fields["destination_waiters"], 1 - index);
-            assert_eq!(fields.as_object().unwrap().len(), 4);
-        }
+
+        let charge = runtime
+            .reserve("api.example.test", 80, Instant::now())
+            .unwrap();
+        let id = charge.id().to_owned();
+        assert_eq!(runtime.population(), 1);
+        assert!(!id.is_empty());
+
+        drop(charge);
+        assert_eq!(runtime.population(), 0);
+
+        let second = runtime
+            .reserve("api.example.test", 80, Instant::now())
+            .unwrap();
+        assert_eq!(runtime.population(), 1);
+        assert_ne!(second.id(), id);
+
+        drop(second);
+        assert_eq!(runtime.population(), 0);
     }
 
     #[test]

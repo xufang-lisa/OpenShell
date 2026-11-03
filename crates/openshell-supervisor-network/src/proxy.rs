@@ -7205,6 +7205,10 @@ fn is_benign_relay_error(err: &miette::Report) -> bool {
     reason = "Test code: test fixtures and explicit control-flow markers are idiomatic in tests."
 )]
 mod tests {
+    #[cfg(target_os = "linux")]
+    mod http_races;
+    #[cfg(target_os = "linux")]
+    mod http_resources;
     mod http_wait;
 
     #[test]

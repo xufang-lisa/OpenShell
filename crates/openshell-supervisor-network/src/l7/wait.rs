@@ -62,6 +62,19 @@ struct Population {
     destinations: HashMap<(String, u16), usize>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WaitRuntimeSnapshot {
+    pub enabled: bool,
+    pub quarantined: bool,
+    pub shutdown: bool,
+    pub total: usize,
+    pub last_terminal_reason: Option<&'static str>,
+    pub budget_seconds: u64,
+    pub sandbox_limit: usize,
+    pub destination_limit: usize,
+    pub destination_waiters: Vec<(String, u16, usize)>,
+}
+
 struct WaitLimits {
     budget: Duration,
     sandbox_limit: usize,
@@ -155,6 +168,29 @@ impl WaitRuntime {
         self.population
             .lock()
             .is_ok_and(|state| state.enabled && !state.shutdown)
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> WaitRuntimeSnapshot {
+        let limits = self.limits.lock().expect("HTTP wait limit lock poisoned");
+        let state = self.population.lock().expect("HTTP wait population lock poisoned");
+        let mut destination_waiters = state
+            .destinations
+            .iter()
+            .map(|((host, port), count)| (host.clone(), *port, *count))
+            .collect::<Vec<_>>();
+        destination_waiters.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+        WaitRuntimeSnapshot {
+            enabled: state.enabled && !state.shutdown,
+            quarantined: state.quarantined,
+            shutdown: state.shutdown,
+            total: state.total,
+            last_terminal_reason: Some(state.last_terminal.reason_code()),
+            budget_seconds: limits.budget.as_secs(),
+            sandbox_limit: limits.sandbox_limit,
+            destination_limit: limits.destination_limit,
+            destination_waiters,
+        }
     }
 
     pub(crate) fn set_proposal_service(
@@ -542,6 +578,28 @@ mod tests {
         let runtime = Arc::new(WaitRuntime::default());
         assert!(runtime.reserve("example.com", 80, Instant::now()).is_none());
         assert_eq!(runtime.population(), 0);
+    }
+
+    #[test]
+    fn runtime_snapshot_reports_active_waits_and_terminal_reason_for_observability() {
+        let runtime = runtime();
+        let charge = runtime.reserve("api.example.test", 80, Instant::now()).unwrap();
+        let snapshot = runtime.snapshot();
+        assert!(snapshot.enabled);
+        assert_eq!(snapshot.total, 1);
+        assert_eq!(snapshot.budget_seconds, 300);
+        assert_eq!(snapshot.sandbox_limit, 16);
+        assert_eq!(snapshot.destination_limit, 4);
+        assert_eq!(snapshot.last_terminal_reason, Some("approval_disabled"));
+        assert_eq!(snapshot.destination_waiters, vec![("api.example.test".to_string(), 80, 1)]);
+        drop(charge);
+        assert_eq!(runtime.snapshot().total, 0);
+        assert_eq!(runtime.snapshot().destination_waiters, Vec::<(String, u16, usize)>::new());
+
+        runtime.configure(false);
+        let disabled = runtime.snapshot();
+        assert!(!disabled.enabled);
+        assert_eq!(disabled.last_terminal_reason, Some("approval_disabled"));
     }
 
     #[test]

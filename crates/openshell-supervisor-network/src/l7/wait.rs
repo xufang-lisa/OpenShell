@@ -4,6 +4,7 @@
 //! Bounded HTTP waiting and original-lifetime fences. Neither coverage nor a
 //! fence supplies identity, routing, credentials or upstream write permission.
 
+use openshell_ocsf::{ActivityId, Endpoint, NetworkActivityBuilder, SeverityId, ocsf_emit};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
@@ -44,6 +45,7 @@ struct Population {
 
 pub struct WaitRuntime {
     population: Mutex<Population>,
+    held_sessions: Arc<super::session::observation::HeldSessionTracker>,
     proposal_service: Mutex<Option<Arc<dyn super::proposal::HeldProposalService>>>,
     policy_engine: Mutex<Weak<crate::opa::OpaEngine>>,
     changed: watch::Sender<u64>,
@@ -71,6 +73,7 @@ impl WaitRuntime {
             return Err(miette::miette!("HTTP wait limits must tighten 300s/16/4"));
         }
         Ok(Self {
+            held_sessions: Arc::default(),
             proposal_service: Mutex::new(None),
             policy_engine: Mutex::new(Weak::new()),
             population: Mutex::new(Population {
@@ -117,14 +120,25 @@ impl WaitRuntime {
     }
 
     pub(crate) fn configure(&self, enabled: bool) {
-        if let Ok(mut state) = self.population.lock() {
+        let changed = self.population.lock().is_ok_and(|mut state| {
+            let changed = state.enabled != enabled;
             if state.enabled && !enabled {
                 state.epoch += 1;
                 state.last_terminal = WaitEnd::Disabled;
                 self.changed.send_replace(state.epoch);
             }
             state.enabled = enabled;
+            changed
+        });
+        if changed {
+            self.held_sessions.configuration_snapshot();
         }
+    }
+
+    pub(crate) fn held_session_tracker(
+        &self,
+    ) -> &Arc<super::session::observation::HeldSessionTracker> {
+        &self.held_sessions
     }
 
     pub(crate) fn quarantine(&self) {
@@ -178,7 +192,8 @@ impl WaitRuntime {
         }
         state.total += 1;
         *state.destinations.entry(key.clone()).or_default() += 1;
-        Some(WaitReservation {
+        let reservation = WaitReservation {
+            id: uuid::Uuid::new_v4().to_string(),
             runtime: self.clone(),
             key,
             deadline,
@@ -188,7 +203,11 @@ impl WaitRuntime {
                 deadline,
                 started: watch::channel(false).0,
             }),
-        })
+        };
+        let counts = (state.total, state.destinations[&reservation.key]);
+        drop(state);
+        reservation.emit_population("reserved", counts);
+        Some(reservation)
     }
 
     #[cfg(test)]
@@ -210,6 +229,7 @@ impl Drop for WaitShutdown {
 /// Not Clone: one waiter, one charge. The transport must be dropped BEFORE
 /// this reservation. `HttpSession` field order enforces that for owned streams.
 pub struct WaitReservation {
+    id: String,
     runtime: Arc<WaitRuntime>,
     key: (String, u16),
     deadline: Instant,
@@ -377,7 +397,36 @@ impl Drop for WaitReservation {
                     state.destinations.remove(&self.key);
                 }
             }
+            let counts = (
+                state.total,
+                state.destinations.get(&self.key).copied().unwrap_or(0),
+            );
+            drop(state);
+            self.emit_population("released", counts);
         }
+    }
+}
+
+impl WaitReservation {
+    pub(crate) fn id(&self) -> &str {
+        &self.id
+    }
+
+    // Mutation-time snapshots, not a new live authorization or metrics API.
+    // Emit outside the population lock; concurrent snapshots can arrive out of order.
+    fn emit_population(&self, action: &str, (total, destination): (usize, usize)) {
+        ocsf_emit!(
+            NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                .activity(ActivityId::Other)
+                .severity(SeverityId::Informational)
+                .dst_endpoint(Endpoint::from_domain(&self.key.0, self.key.1))
+                .unmapped("reservation_id", serde_json::json!(self.id))
+                .unmapped("reservation_action", serde_json::json!(action))
+                .unmapped("sandbox_waiters", serde_json::json!(total))
+                .unmapped("destination_waiters", serde_json::json!(destination))
+                .message("HTTP_HITL_RESERVATION population snapshot; not execution authority")
+                .build()
+        );
     }
 }
 
@@ -414,6 +463,53 @@ mod tests {
         let runtime = Arc::new(WaitRuntime::default());
         assert!(runtime.reserve("example.com", 80, Instant::now()).is_none());
         assert_eq!(runtime.population(), 0);
+    }
+
+    #[test]
+    fn reservation_events_bind_mutation_snapshots_without_logging_request_bytes() {
+        use std::io::Write;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        #[derive(Clone)]
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry()
+            .with(openshell_ocsf::OcsfJsonlLayer::new(Capture(output.clone())));
+        let runtime = runtime();
+        let id = tracing::subscriber::with_default(subscriber, || {
+            let charge = runtime
+                .reserve("api.example.test", 80, Instant::now())
+                .unwrap();
+            let id = charge.id().to_owned();
+            assert_eq!(runtime.population(), 1);
+            drop(charge);
+            assert_eq!(runtime.population(), 0);
+            id
+        });
+        let bytes = output.lock().unwrap();
+        let records: Vec<serde_json::Value> = std::str::from_utf8(&bytes)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 2);
+        for (index, action) in ["reserved", "released"].into_iter().enumerate() {
+            let fields = &records[index]["unmapped"];
+            assert_eq!(fields["reservation_id"], id);
+            assert_eq!(fields["reservation_action"], action);
+            assert_eq!(fields["sandbox_waiters"], 1 - index);
+            assert_eq!(fields["destination_waiters"], 1 - index);
+            assert_eq!(fields.as_object().unwrap().len(), 4);
+        }
     }
 
     #[test]

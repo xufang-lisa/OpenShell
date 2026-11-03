@@ -8,6 +8,7 @@ use crate::l7::wait::{WaitEnd, WaitReservation, WaitRuntime};
 use crate::test_support::policy_with_native_executable_paths;
 use openshell_core::proposals::AgentProposals;
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::watch;
 use tokio::time::Instant;
 
@@ -321,5 +322,252 @@ async fn workspace_change_blocks_pending_and_already_started_exchanges() {
         fixture.workspace.send_replace("different-team".to_owned());
         assert_blocked(&mut fence, "held workspace changed");
         assert_eq!(fence.inner.bytes.len(), usize::from(started));
+    }
+}
+
+/// Simulated `HeldProposalService` only: these component fixtures reserve the
+/// held slot directly and do not exercise submission or actual human review.
+struct SimulatedComponentReview;
+
+impl crate::l7::proposal::HeldProposalService for SimulatedComponentReview {
+    fn observe<'a>(
+        &'a self,
+        _: &'a str,
+        _: &'a str,
+    ) -> crate::l7::proposal::ProposalObservation<'a> {
+        Box::pin(async { Ok(crate::l7::proposal::ReviewDecision::Pending) })
+    }
+
+    fn submit<'a>(
+        &'a self,
+        _: &'a crate::l7::proposal::HeldProposalInput,
+    ) -> crate::l7::proposal::ProposalSubmission<'a> {
+        Box::pin(async { Ok("simulated-component-review".to_owned()) })
+    }
+}
+
+/// Test-only gate OUTSIDE the completed TLS client. Pending here cannot
+/// enqueue plaintext into Rustls or forward a TLS record to the peer.
+struct GatedTlsWriter<W> {
+    inner: W,
+    ready: Option<usize>,
+    write_polls: usize,
+    inner_write_polls: usize,
+    accepted_bytes: usize,
+    flush_polls: usize,
+    shutdown_polls: usize,
+}
+
+impl<W: AsyncWrite + Unpin> AsyncWrite for GatedTlsWriter<W> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.write_polls += 1;
+        let Some(limit) = self.ready else {
+            return Poll::Pending;
+        };
+        self.inner_write_polls += 1;
+        let count = bytes.len().min(limit);
+        let result = Pin::new(&mut self.inner).poll_write(cx, &bytes[..count]);
+        if let Poll::Ready(Ok(n)) = &result {
+            self.accepted_bytes += *n;
+        }
+        result
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.flush_polls += 1;
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.shutdown_polls += 1;
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+impl<W> GatedTlsWriter<W> {
+    fn polls(&self) -> (usize, usize, usize, usize, usize) {
+        (
+            self.write_polls,
+            self.inner_write_polls,
+            self.accepted_bytes,
+            self.flush_polls,
+            self.shutdown_polls,
+        )
+    }
+}
+
+async fn completed_tls_simulated_review_fence_case(
+    version: &'static rustls::SupportedProtocolVersion,
+    started: bool,
+    reload: bool,
+) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let ca = crate::l7::tls::SandboxCa::generate().unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        for certificate in rustls_pemfile::certs(&mut ca.cert_pem().as_bytes()) {
+            roots.add(certificate.unwrap()).unwrap();
+        }
+        let config = Arc::new(
+            openshell_crypto::tls::client_builder_with_protocol_versions(&[version])
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let state = ProxyTlsState::new(crate::l7::tls::CertCache::new(ca), config.clone());
+
+        // Each terminal cell MUST first prove a positive decrypted-byte
+        // baseline on a separate, equally verified/forced-version TLS pair.
+        for baseline in [true, false] {
+            let fixture = Fixture::new(Instant::now());
+            fixture
+                .environment
+                .engine
+                .set_http_hitl_proposal_service(Arc::new(SimulatedComponentReview));
+            let (client_transport, peer_transport) = tokio::io::duplex(64 * 1024);
+            let connector = tokio_rustls::TlsConnector::from(config.clone());
+            let (client, peer) = tokio::join!(
+                connector.connect(
+                    rustls::pki_types::ServerName::try_from("example.com").unwrap(),
+                    client_transport,
+                ),
+                crate::l7::tls::tls_terminate_client(peer_transport, &state, "example.com"),
+            );
+            let client = client.unwrap();
+            let mut peer = peer.unwrap();
+            assert_eq!(client.get_ref().1.protocol_version(), Some(version.version));
+            assert!(!client.get_ref().1.is_handshaking());
+            assert_eq!(fixture.runtime.population(), 1);
+            assert_eq!(fixture.reservation.destination(), ("example.com", 443));
+            let mut fence = ApplicationFence {
+                inner: GatedTlsWriter {
+                    inner: client,
+                    ready: None,
+                    write_polls: 0,
+                    inner_write_polls: 0,
+                    accepted_bytes: 0,
+                    flush_polls: 0,
+                    shutdown_polls: 0,
+                },
+                policy: &fixture.policy,
+                lifetime: &fixture.lifetime,
+                environment: &fixture.environment,
+                workspace: WORKSPACE,
+            };
+            {
+                let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+                assert!(
+                    Pin::new(&mut fence)
+                        .poll_write(&mut cx, REQUEST)
+                        .is_pending()
+                );
+            }
+            assert_eq!(fence.inner.polls(), (1, 0, 0, 0, 0));
+            assert!(!fixture.lifetime.has_started());
+
+            let mut observed = Vec::new();
+            if baseline || started {
+                let expected = if baseline { REQUEST } else { &REQUEST[..1] };
+                fence.inner.ready = Some(expected.len());
+                fence.write_all(expected).await.unwrap();
+                fence.flush().await.unwrap();
+                observed.resize(expected.len(), 0);
+                peer.read_exact(&mut observed).await.unwrap();
+                assert_eq!(
+                    observed, expected,
+                    "positive decrypted-byte baseline/first byte"
+                );
+                assert_eq!(fence.inner.accepted_bytes, expected.len());
+                assert!(fixture.lifetime.has_started());
+            }
+            if baseline {
+                fence.shutdown().await.unwrap();
+            } else {
+                let expected_error = if reload {
+                    fixture.reload();
+                    "held policy stale"
+                } else {
+                    fixture.runtime.configure(false);
+                    if !started {
+                        fixture.runtime.configure(true);
+                    }
+                    assert_eq!(fixture.lifetime.check(), Err(WaitEnd::Disabled));
+                    "held lifetime ended"
+                };
+                let before = fence.inner.polls();
+                // The gate is now writable. The PRODUCTION ApplicationFence
+                // must reject write/flush/shutdown without entering the gate.
+                fence.inner.ready = Some(REQUEST.len());
+                let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+                assert_error(
+                    Pin::new(&mut fence).poll_write(&mut cx, REQUEST),
+                    expected_error,
+                );
+                assert_error(Pin::new(&mut fence).poll_flush(&mut cx), expected_error);
+                assert_error(Pin::new(&mut fence).poll_shutdown(&mut cx), expected_error);
+                assert_eq!(fence.inner.polls(), before, "no inner I/O after revocation");
+                assert_eq!(fixture.lifetime.has_started(), started);
+            }
+            drop(fence);
+            // Actual decrypted peer I/O, not encrypted-wire-byte accounting.
+            // A terminal drop has no close_notify, so unclean TLS EOF is valid.
+            let mut trailing = Vec::new();
+            match peer.read_to_end(&mut trailing).await {
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {}
+                Err(error) => panic!("completed TLS peer read: {error}"),
+            }
+            assert!(trailing.is_empty(), "no additional peer HTTP bytes");
+            assert_eq!(
+                observed.len(),
+                if baseline {
+                    REQUEST.len()
+                } else {
+                    usize::from(started)
+                }
+            );
+            let runtime = fixture.runtime.clone();
+            drop(fixture);
+            assert_eq!(runtime.population(), 0, "original held charge released");
+        }
+        // These are direct ApplicationFence components, not resume_once or
+        // full relay execution: no native HTTP_HITL_EXCHANGE log is asserted.
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "completed TLS fence timed out: {:?}, started={started}, reload={reload}",
+            version.version
+        )
+    });
+}
+
+#[tokio::test]
+async fn completed_tls_simulated_review_pending_repoll_after_policy_reload_never_writes() {
+    for version in [&rustls::version::TLS12, &rustls::version::TLS13] {
+        completed_tls_simulated_review_fence_case(version, false, true).await;
+    }
+}
+
+#[tokio::test]
+async fn completed_tls_simulated_review_pending_repoll_after_disable_reenable_never_writes() {
+    for version in [&rustls::version::TLS12, &rustls::version::TLS13] {
+        completed_tls_simulated_review_fence_case(version, false, false).await;
+    }
+}
+
+#[tokio::test]
+async fn completed_tls_simulated_review_first_byte_then_policy_reload_blocks_subsequent_io() {
+    for version in [&rustls::version::TLS12, &rustls::version::TLS13] {
+        completed_tls_simulated_review_fence_case(version, true, true).await;
+    }
+}
+
+#[tokio::test]
+async fn completed_tls_simulated_review_first_byte_then_disable_blocks_subsequent_io() {
+    for version in [&rustls::version::TLS12, &rustls::version::TLS13] {
+        completed_tls_simulated_review_fence_case(version, true, false).await;
     }
 }

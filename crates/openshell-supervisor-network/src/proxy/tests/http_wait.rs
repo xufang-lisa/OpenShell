@@ -4,6 +4,8 @@
 use super::*;
 use futures::poll;
 
+// Every review in these ingress fixtures uses a simulated HeldProposalService;
+// none exercises an actual manual-human decision or a live Gateway review RPC.
 #[derive(Default)]
 struct HeldIntentRecorder {
     metadata: std::sync::Mutex<Vec<String>>,
@@ -118,7 +120,7 @@ async fn serve_held_once<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin
     assert!(read_held_close(stream, tls).await.is_empty());
 }
 
-fn held_proposal_context() -> Arc<PolicyLocalContext> {
+pub(super) fn held_proposal_context() -> Arc<PolicyLocalContext> {
     Arc::new(PolicyLocalContext::new(
         None,
         None,
@@ -401,7 +403,7 @@ async fn forward_production_ingress_resume_once_without_early_dial() {
     .expect("production FORWARD must resume once only after approval and coverage");
 }
 
-fn held_test_identity() -> ContractBinaryIdentity {
+pub(super) fn held_test_identity() -> ContractBinaryIdentity {
     // Supplied by this trusted test fixture, NOT sampled from a live process.
     ContractBinaryIdentity {
         executable: ContractExecutableIdentity {
@@ -545,6 +547,7 @@ enum HeldTlsEnd {
     Response,
     StaleBeforeWrite,
     ClientClosedBeforeWrite,
+    SimulatedRejectedBeforeReadmission,
 }
 
 async fn held_tls_ingress_case(
@@ -628,6 +631,25 @@ async fn held_tls_ingress_case(
         drive_held_until(handler.as_mut(), || recorder.observations.load(Ordering::Acquire) > observations).await;
         assert_eq!(engine.http_hitl_wait_runtime().population(), 1);
         assert_no_held_dial(&listener).await;
+        if matches!(end, HeldTlsEnd::SimulatedRejectedBeforeReadmission) {
+            // BOTH original and retired-upstream handshakes have completed.
+            // Installed coverage alone above still holds Q while the simulated
+            // HeldProposalService says Pending. Rejection must now retire Q,
+            // not dial a fresh peer even though coverage remains installed.
+            assert_eq!(recorder.decision.load(Ordering::Acquire), 0);
+            recorder.decision.store(2, Ordering::Release);
+            engine.reload(include_str!("../../../data/sandbox-policy.rego"), &covered).unwrap();
+            let client = async {
+                assert!(read_held_close(&mut wire, true).await.is_empty(), "rejected original TLS client must reach EOF without HTTP");
+                assert_eq!(wire.get_ref().1.protocol_version(), Some(original_version.version));
+            };
+            let (result, ()) = tokio::join!(handler, client);
+            result.unwrap();
+            assert_no_held_dial(&listener).await;
+            assert_eq!(engine.http_hitl_wait_runtime().population(), 0);
+            assert_eq!(recorder.metadata.lock().unwrap().len(), 1);
+            return;
+        }
         recorder.decision.store(1, Ordering::Release);
         engine.reload(include_str!("../../../data/sandbox-policy.rego"), &covered).unwrap();
         let (fresh, _) = tokio::select! {
@@ -670,6 +692,7 @@ async fn held_tls_ingress_case(
                 let (result, (), ()) = tokio::join!(handler, server, client);
                 result.unwrap();
             }
+            HeldTlsEnd::SimulatedRejectedBeforeReadmission => unreachable!("rejection retires before fresh dial"),
         }
         assert_no_held_dial(&listener).await;
         assert_eq!(engine.http_hitl_wait_runtime().population(), 0);
@@ -704,4 +727,19 @@ async fn connect_production_ingress_client_cancel_before_fresh_tls_write_aborts(
         HeldTlsEnd::ClientClosedBeforeWrite,
     )
     .await;
+}
+
+#[tokio::test]
+async fn connect_production_ingress_simulated_rejection_after_covered_pending_tls_four_grid_never_dials()
+ {
+    for original in [&rustls::version::TLS12, &rustls::version::TLS13] {
+        for upstream in [&rustls::version::TLS12, &rustls::version::TLS13] {
+            held_tls_ingress_case(
+                original,
+                upstream,
+                HeldTlsEnd::SimulatedRejectedBeforeReadmission,
+            )
+            .await;
+        }
+    }
 }

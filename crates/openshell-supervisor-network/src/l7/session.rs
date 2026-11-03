@@ -109,6 +109,8 @@ pub struct RequestSlot {
     submitted_proposal: Option<String>,
     review_request_id: Option<String>,
     review_progress: ReviewProgress,
+    // LAST: passive accounting ends after all request/charge state is dropped.
+    held_session: Option<observation::HeldSession>,
 }
 
 impl Default for RequestSlot {
@@ -133,6 +135,7 @@ impl RequestSlot {
             submitted_proposal: None,
             review_request_id: None,
             review_progress: ReviewProgress::Unknown,
+            held_session: None,
         }
     }
 
@@ -353,8 +356,15 @@ impl RequestSlot {
         if engine.is_stale() {
             return false;
         }
+        let request_id = uuid::Uuid::new_v4().to_string();
+        self.held_session = Some(
+            engine
+                .http_hitl_wait_runtime()
+                .held_session_tracker()
+                .start(request_id.clone(), reservation.id().to_owned()),
+        );
         self.waiter = Some(reservation);
-        self.review_request_id = Some(uuid::Uuid::new_v4().to_string());
+        self.review_request_id = Some(request_id);
         self.state = CaptureState::PendingReview;
         // Admission was classified, but it conveys NO retained execution
         // authority. No policy/evaluator is needed by the waiting owner.
@@ -365,6 +375,10 @@ impl RequestSlot {
                 .severity(SeverityId::Informational)
                 .dst_endpoint(Endpoint::from_domain(host, port))
                 .unmapped("request_id", serde_json::json!(self.review_request_id))
+                .unmapped(
+                    "reservation_id",
+                    serde_json::json!(self.waiter.as_ref().map(super::wait::WaitReservation::id))
+                )
                 .message("HTTP_HITL_WAIT admitted; awaiting review and fresh admission")
                 .build()
         );
@@ -451,6 +465,7 @@ impl<C: tokio::io::AsyncRead> HttpSession<C> {
             return None;
         }
         let waiter = self.slot.waiter.as_ref()?;
+        let mut completed_observations = 0_u32;
         let outcome = 'waiting: {
             if self.slot.submitted_proposal.is_none()
                 && let (Some(service), Some(input)) =
@@ -511,7 +526,9 @@ impl<C: tokio::io::AsyncRead> HttpSession<C> {
                     loop {
                         use super::proposal::{ProposalSubmitError, ReviewDecision};
                         let guard = waiter.policy_guard();
-                        let next = match service.observe(input.workspace(), chunk_id).await {
+                        let decision = service.observe(input.workspace(), chunk_id).await;
+                        completed_observations = completed_observations.saturating_add(1);
+                        let next = match decision {
                             Ok(ReviewDecision::Rejected) => {
                                 break ReviewWaitOutcome::Terminal(
                                     super::wait::WaitEnd::ProposalRejected,
@@ -532,7 +549,9 @@ impl<C: tokio::io::AsyncRead> HttpSession<C> {
                                 ReviewProgress::Unknown
                             }
                         };
-                        if *progress != next {
+                        // One checkpoint proves a second completed RPC even when
+                        // Pending is unchanged; do not emit on every polling tick.
+                        if *progress != next || completed_observations == 2 {
                             *progress = next;
                             ocsf_emit!(
                                 NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
@@ -544,6 +563,7 @@ impl<C: tokio::io::AsyncRead> HttpSession<C> {
                                     ))
                                     .unmapped("request_id", serde_json::json!(request_id))
                                     .unmapped("chunk_id", serde_json::json!(chunk_id))
+                                    .unmapped("completed_observations", serde_json::json!(completed_observations))
                                     .message(format!("HTTP_HITL_REVIEW state={next:?}; observation is not execution authority"))
                                     .build()
                             );
@@ -595,6 +615,10 @@ impl<C: tokio::io::AsyncRead> HttpSession<C> {
                 .dst_endpoint(Endpoint::from_domain(host, port))
                 .unmapped("request_id", serde_json::json!(self.slot.review_request_id))
                 .unmapped("chunk_id", serde_json::json!(self.slot.submitted_proposal))
+                .unmapped(
+                    "completed_observations",
+                    serde_json::json!(completed_observations)
+                )
                 .message(format!("HTTP_HITL_WAIT terminal={reason:?}; no release"))
                 .build()
         );
@@ -626,3 +650,5 @@ impl<C: tokio::io::AsyncRead> HttpSession<C> {
 
 #[cfg(test)]
 mod tests;
+
+pub(crate) mod observation;

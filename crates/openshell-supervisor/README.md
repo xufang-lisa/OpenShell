@@ -28,6 +28,17 @@ Diagnostics and OCSF shorthand share a bounded, nonblocking stderr writer. With 
 
 Console JSON is installed independently of optional file appenders and uses an INFO filter independent of the diagnostic filter. Its runtime enabled flag and target schema version are shared with the existing JSONL file layer. The supervisor retains the writer guards until shutdown. The gateway log push layer continues to emit shorthand only.
 
+Endpoint delivery emits `ENDPOINT_STATUS_REPORT` only after a report RPC or its
+timeout wrapper completes. `report_result=acknowledged` means the actual client
+RPC returned success, not merely dispatch or an HTTP 200 response. Other values
+are `retryable_error`, `terminal_error` and `timeout`; a cancelled/superseded RPC
+cannot acknowledge. Fields bind sandbox, supervisor session, policy hash,
+provider revision, sequence and attempt, without endpoint observations or error
+payloads. Revision and sequence are decimal strings to preserve full uint64
+precision in JSON consumers. This is passive delivery evidence, not execution
+authority or a new retry policy. The [live follow-up](../../../HITL/http-hitl-held-owner-ack-validation-2026-10-31-zh-CN.md)
+records an immutable retry followed by an actual acknowledgement.
+
 ## Safe runtime and parent liveness
 
 The supervisor drives the safe isolation-backend contract and network/policy

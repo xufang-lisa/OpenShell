@@ -15,6 +15,7 @@ use openshell_core::endpoint_status::{
 };
 use openshell_core::mcp::is_mcp_protocol;
 use openshell_core::proto::SandboxPolicy;
+use openshell_ocsf::{ConfigStateChangeBuilder, SeverityId, ocsf_emit};
 use tokio::time::timeout;
 use tracing::warn;
 
@@ -209,15 +210,21 @@ pub async fn run_reporter<C: PolicyGatewayClient>(
             };
 
             match result {
-                Ok(Ok(())) => continue 'outbox,
+                Ok(Ok(())) => {
+                    emit_report_result(&sandbox_id, &snapshot, attempt, "acknowledged");
+                    continue 'outbox;
+                }
                 Ok(Err(error)) if !is_retryable_error(&error) => {
+                    emit_report_result(&sandbox_id, &snapshot, attempt, "terminal_error");
                     warn!(%error, "Discarding terminal endpoint status snapshot");
                     continue 'outbox;
                 }
                 Ok(Err(error)) => {
+                    emit_report_result(&sandbox_id, &snapshot, attempt, "retryable_error");
                     warn!(%error, attempt, "Endpoint status report failed transiently; retaining immutable snapshot");
                 }
                 Err(error) => {
+                    emit_report_result(&sandbox_id, &snapshot, attempt, "timeout");
                     warn!(%error, attempt, "Endpoint status report timed out; retaining immutable snapshot");
                 }
             }
@@ -275,6 +282,41 @@ pub async fn run_reporter<C: PolicyGatewayClient>(
             }
         }
     }
+}
+
+// Only completed RPC results (including the timeout wrapper), never dispatch
+// or HTTP 200. Cancelled/superseded in-flight snapshots cannot emit an ACK.
+fn emit_report_result(
+    sandbox_id: &str,
+    snapshot: &openshell_core::endpoint_status::EndpointStatusSnapshot,
+    attempt: u32,
+    result: &str,
+) {
+    ocsf_emit!(
+        ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
+            .severity(SeverityId::Informational)
+            .unmapped("sandbox_id", serde_json::json!(sandbox_id))
+            .unmapped(
+                "supervisor_session_id",
+                serde_json::json!(snapshot.supervisor_session_id)
+            )
+            .unmapped(
+                "policy_hash",
+                serde_json::json!(snapshot.config_version.policy_hash)
+            )
+            .unmapped(
+                "provider_env_revision",
+                serde_json::json!(snapshot.config_version.provider_env_revision.to_string())
+            )
+            .unmapped(
+                "report_sequence",
+                serde_json::json!(snapshot.report_sequence.to_string())
+            )
+            .unmapped("report_attempt", serde_json::json!(attempt))
+            .unmapped("report_result", serde_json::json!(result))
+            .message("ENDPOINT_STATUS_REPORT completed RPC; passive delivery observation")
+            .build()
+    );
 }
 
 fn apply_session_change(
@@ -904,6 +946,99 @@ mod tests {
         fn workspace(&self) -> String {
             String::new()
         }
+    }
+
+    #[tokio::test]
+    async fn report_ack_only_after_completion_never_for_superseded_dispatch() {
+        use std::io::Write;
+        use std::sync::Mutex;
+        use tracing::instrument::WithSubscriber;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        #[derive(Clone)]
+        struct Capture(Arc<Mutex<Vec<u8>>>, Arc<tokio::sync::Notify>);
+        impl Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                self.1.notify_one();
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let written = Arc::new(tokio::sync::Notify::new());
+        let capture = Capture(bytes.clone(), written.clone());
+        let subscriber =
+            tracing_subscriber::registry().with(openshell_ocsf::OcsfJsonlLayer::new(capture));
+        let (sender, receiver) = endpoint_status_channel();
+        let (reports, mut reports_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_session_tx, session_rx) = tokio::sync::watch::channel(Some("session-test".into()));
+        let reporter = tokio::spawn(
+            run_reporter(
+                ControlledEndpointStatusGateway { reports },
+                "sandbox-test".into(),
+                receiver,
+                session_rx,
+            )
+            .with_subscriber(subscriber),
+        );
+        sender
+            .reset(
+                EndpointConfigVersion {
+                    policy_hash: "policy-old".into(),
+                    provider_env_revision: u64::MAX,
+                },
+                vec![],
+            )
+            .await
+            .unwrap();
+        let old = timeout(Duration::from_secs(1), reports_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(bytes.lock().unwrap().is_empty(), "dispatch is not an ACK");
+        sender
+            .reset(
+                EndpointConfigVersion {
+                    policy_hash: "policy-current".into(),
+                    provider_env_revision: u64::MAX,
+                },
+                vec![],
+            )
+            .await
+            .unwrap();
+        let current = timeout(Duration::from_secs(1), reports_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(old.complete.is_closed(), "reset retired the old RPC");
+        assert!(
+            bytes.lock().unwrap().is_empty(),
+            "cancelled dispatch cannot acknowledge"
+        );
+        let sequence = current.snapshot.report_sequence;
+        current.complete.send(Ok(())).unwrap();
+        timeout(Duration::from_secs(1), written.notified())
+            .await
+            .expect("actual ACK must reach the JSON writer before aborting the reporter");
+        reporter.abort();
+        assert!(reporter.await.unwrap_err().is_cancelled());
+        let bytes = bytes.lock().unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        let records: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 1);
+        let fields = &records[0]["unmapped"];
+        assert_eq!(fields["report_result"], "acknowledged");
+        assert_eq!(fields["policy_hash"], "policy-current");
+        assert_eq!(fields["supervisor_session_id"], "session-test");
+        assert_eq!(fields["provider_env_revision"], u64::MAX.to_string());
+        assert_eq!(fields["report_sequence"], sequence.to_string());
+        assert_eq!(fields.as_object().unwrap().len(), 7);
     }
 
     async fn assert_reset_supersedes_pending_snapshot(during_backoff: bool) {

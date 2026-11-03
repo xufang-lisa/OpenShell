@@ -96,6 +96,21 @@ response successfully, or `effect_unknown` when a started HTTP exchange fails.
 Session WAIT/PROPOSAL admission messages now describe awaiting review/fresh
 admission; REVIEW says observation is not execution authority, not release disabled.
 
+Passive owner accounting is separate from reservation population. The OCSF
+`HTTP_HITL_SESSION` Base Event records `session_action` (`configuration`,
+`started`, `retired`), `active_held_sessions` and a decimal-string
+`lifecycle_sequence`. Start/retirement also bind `request_id` and
+`reservation_id`. The guard is the last `RequestSlot` field: owned client,
+request state and charge retire before its final snapshot. Terminal state alone
+does not retire the guard. It counts held wait/resume owners, not all proxy/Tokio
+tasks or open FDs. Capture an actual pre-request zero sample; initial settings
+may be applied before JSON logging is enabled. Snapshots emit outside their
+separate observation mutex and may arrive out of order; they never gate I/O.
+
+The [owner/ACK live follow-up](../../../HITL/http-hitl-held-owner-ack-validation-2026-10-31-zh-CN.md)
+records bounded production evidence and remaining wider task-census gaps. It
+does not grant production or full executor-continuity qualification.
+
 Historical no-release fixtures remain intentional:
 `HttpSession::wait_no_release()` still uses `readmission_end()` and returns
 `CurrentExecutorUnavailable` when its lifetime/generation checks pass. The

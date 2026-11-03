@@ -947,6 +947,13 @@ async fn approval_wait_hands_off_exactly_one_frozen_request_without_cleanup_or_q
         ReviewProgress::CoveredNoAuthority { generation: 1 }
     );
     assert_eq!(engine.http_hitl_wait_runtime().population(), 1);
+    assert_eq!(
+        engine
+            .http_hitl_wait_runtime()
+            .held_session_tracker()
+            .active(),
+        1
+    );
     assert!(Arc::ptr_eq(&fence, &session.slot().resume_fence().unwrap()));
     let guard = session.slot().readmission_guard(1).unwrap();
     assert_eq!(session.wait_for_approval().await, None);
@@ -961,8 +968,83 @@ async fn approval_wait_hands_off_exactly_one_frozen_request_without_cleanup_or_q
     session.slot.terminate();
     assert!(session.slot().frozen().is_none());
     assert_eq!(engine.http_hitl_wait_runtime().population(), 1);
+    assert_eq!(
+        engine
+            .http_hitl_wait_runtime()
+            .held_session_tracker()
+            .active(),
+        1
+    );
     drop(session);
     assert_eq!(engine.http_hitl_wait_runtime().population(), 0);
+    assert_eq!(
+        engine
+            .http_hitl_wait_runtime()
+            .held_session_tracker()
+            .active(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn held_owner_abort_before_first_wait_poll_returns_independent_count() {
+    let engine = std::sync::Arc::new(engine());
+    engine.set_http_hitl_wait_enabled(true);
+    assert_eq!(
+        engine
+            .http_hitl_wait_runtime()
+            .held_session_tracker()
+            .active(),
+        0
+    );
+    let (_wire, mut session) = approval_session(&engine).await;
+    assert_eq!(
+        engine
+            .http_hitl_wait_runtime()
+            .held_session_tracker()
+            .active(),
+        1
+    );
+    let task = tokio::spawn(async move { session.wait_for_approval().await });
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert_eq!(
+        engine
+            .http_hitl_wait_runtime()
+            .held_session_tracker()
+            .active(),
+        0
+    );
+    assert_eq!(engine.http_hitl_wait_runtime().population(), 0);
+}
+
+#[tokio::test]
+async fn held_owner_early_client_close_does_not_retire_until_session_drop() {
+    let engine = std::sync::Arc::new(engine());
+    engine.set_http_hitl_wait_enabled(true);
+    let (wire, mut session) = approval_session(&engine).await;
+    drop(wire);
+    assert_eq!(
+        session.wait_for_approval().await,
+        Some(ReviewWaitOutcome::Terminal(
+            super::super::wait::WaitEnd::ClientClosed
+        ))
+    );
+    assert_eq!(
+        engine
+            .http_hitl_wait_runtime()
+            .held_session_tracker()
+            .active(),
+        1
+    );
+    drop(session);
+    assert_eq!(
+        engine
+            .http_hitl_wait_runtime()
+            .held_session_tracker()
+            .active(),
+        0
+    );
 }
 
 #[tokio::test(start_paused = true)]

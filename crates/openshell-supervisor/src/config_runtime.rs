@@ -1468,6 +1468,21 @@ fn extract_bool_setting(
         })
 }
 
+fn extract_int_setting(
+    settings: &std::collections::HashMap<String, openshell_core::proto::EffectiveSetting>,
+    key: &str,
+) -> Option<i64> {
+    use openshell_core::proto::setting_value;
+    settings
+        .get(key)
+        .and_then(|es| es.value.as_ref())
+        .and_then(|sv| sv.value.as_ref())
+        .and_then(|v| match v {
+            setting_value::Value::IntValue(value) => Some(*value),
+            _ => None,
+        })
+}
+
 fn apply_ocsf_schema_version_setting(
     version: &std::sync::Mutex<String>,
     settings: &std::collections::HashMap<String, openshell_core::proto::EffectiveSetting>,
@@ -1519,6 +1534,32 @@ pub fn apply_http_hitl_classification_setting(
             openshell_core::settings::HTTP_HITL_WAIT_ENABLED_KEY,
         )
         .unwrap_or(false),
+    );
+
+    // Effective settings may tighten the wait budget but never widen the runtime
+    // beyond the safety cap. Invalid or unset values keep the current hard limit.
+    let timeout_seconds = extract_int_setting(
+        settings,
+        openshell_core::settings::HTTP_HITL_WAIT_TIMEOUT_SECONDS_KEY,
+    )
+    .unwrap_or(300)
+    .clamp(1, 300) as u64;
+    let sandbox_limit = extract_int_setting(
+        settings,
+        openshell_core::settings::HTTP_HITL_WAIT_SANDBOX_LIMIT_KEY,
+    )
+    .unwrap_or(16)
+    .clamp(1, 16) as usize;
+    let destination_limit = extract_int_setting(
+        settings,
+        openshell_core::settings::HTTP_HITL_WAIT_DESTINATION_LIMIT_KEY,
+    )
+    .unwrap_or(4)
+    .clamp(1, 4) as usize;
+    engine.set_http_hitl_wait_limits(
+        Duration::from_secs(timeout_seconds),
+        sandbox_limit,
+        destination_limit,
     );
 }
 

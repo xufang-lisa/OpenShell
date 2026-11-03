@@ -62,20 +62,24 @@ struct Population {
     destinations: HashMap<(String, u16), usize>,
 }
 
+struct WaitLimits {
+    budget: Duration,
+    sandbox_limit: usize,
+    destination_limit: usize,
+}
+
 pub struct WaitRuntime {
     population: Mutex<Population>,
     held_sessions: Arc<super::session::observation::HeldSessionTracker>,
     proposal_service: Mutex<Option<Arc<dyn super::proposal::HeldProposalService>>>,
     policy_engine: Mutex<Weak<crate::opa::OpaEngine>>,
     changed: watch::Sender<u64>,
-    budget: Duration,
-    sandbox_limit: usize,
-    destination_limit: usize,
+    limits: Mutex<WaitLimits>,
 }
 
 impl Default for WaitRuntime {
     fn default() -> Self {
-        Self::with_limits(Duration::from_mins(5), 16, 4)
+        Self::with_limits(Duration::from_secs(300), 16, 4)
             .expect("fixed HTTP wait limits satisfy the safety caps")
     }
 }
@@ -83,7 +87,7 @@ impl Default for WaitRuntime {
 impl WaitRuntime {
     fn with_limits(budget: Duration, sandbox: usize, destination: usize) -> miette::Result<Self> {
         if budget.is_zero()
-            || budget > Duration::from_mins(5)
+            || budget > Duration::from_secs(300)
             || sandbox == 0
             || sandbox > 16
             || destination == 0
@@ -105,10 +109,46 @@ impl WaitRuntime {
                 destinations: HashMap::new(),
             }),
             changed: watch::channel(0).0,
-            budget,
-            sandbox_limit: sandbox,
-            destination_limit: destination,
+            limits: Mutex::new(WaitLimits {
+                budget,
+                sandbox_limit: sandbox,
+                destination_limit: destination,
+            }),
         })
+    }
+
+    pub fn budget(&self) -> Duration {
+        self.limits.lock().unwrap().budget
+    }
+
+    pub fn sandbox_limit(&self) -> usize {
+        self.limits.lock().unwrap().sandbox_limit
+    }
+
+    pub fn destination_limit(&self) -> usize {
+        self.limits.lock().unwrap().destination_limit
+    }
+
+    pub fn configure_limits(
+        &self,
+        budget: Duration,
+        sandbox: usize,
+        destination: usize,
+    ) -> miette::Result<()> {
+        if budget.is_zero()
+            || budget > Duration::from_secs(300)
+            || sandbox == 0
+            || sandbox > 16
+            || destination == 0
+            || destination > 4
+        {
+            return Err(miette::miette!("HTTP wait limits must tighten 300s/16/4"));
+        }
+        let mut limits = self.limits.lock().expect("HTTP wait limit lock poisoned");
+        limits.budget = budget;
+        limits.sandbox_limit = sandbox;
+        limits.destination_limit = destination;
+        Ok(())
     }
 
     pub(crate) fn enabled(&self) -> bool {
@@ -198,14 +238,15 @@ impl WaitRuntime {
             .parse::<std::net::IpAddr>()
             .map_or_else(|_| host.to_ascii_lowercase(), |address| address.to_string());
         let key = (host, port);
-        let deadline = captured_at.checked_add(self.budget)?;
+        let limits = self.limits.lock().ok()?;
+        let deadline = captured_at.checked_add(limits.budget)?;
         let mut state = self.population.lock().ok()?;
         if !state.enabled
             || state.quarantined
             || state.shutdown
             || Instant::now() >= deadline
-            || state.total >= self.sandbox_limit
-            || state.destinations.get(&key).copied().unwrap_or(0) >= self.destination_limit
+            || state.total >= limits.sandbox_limit
+            || state.destinations.get(&key).copied().unwrap_or(0) >= limits.destination_limit
         {
             return None;
         }
@@ -462,6 +503,25 @@ mod tests {
         let runtime = Arc::new(WaitRuntime::default());
         runtime.configure(true);
         runtime
+    }
+
+    #[test]
+    fn default_runtime_uses_hard_caps_and_supports_tightening() {
+        let runtime = WaitRuntime::default();
+        assert_eq!(runtime.budget(), Duration::from_secs(300));
+        assert_eq!(runtime.sandbox_limit(), 16);
+        assert_eq!(runtime.destination_limit(), 4);
+
+        runtime
+            .configure_limits(Duration::from_secs(120), 8, 2)
+            .expect("valid tightened limits should be accepted");
+        assert_eq!(runtime.budget(), Duration::from_secs(120));
+        assert_eq!(runtime.sandbox_limit(), 8);
+        assert_eq!(runtime.destination_limit(), 2);
+
+        assert!(runtime.configure_limits(Duration::from_secs(301), 8, 2).is_err());
+        assert!(runtime.configure_limits(Duration::from_secs(120), 17, 2).is_err());
+        assert!(runtime.configure_limits(Duration::from_secs(120), 8, 5).is_err());
     }
 
     #[test]

@@ -88,11 +88,26 @@ pub const AGENT_POLICY_PROPOSALS_ENABLED_KEY: &str = "agent_policy_proposals_ena
 /// not hold requests, submit proposals, grant authority, or forward denials.
 pub const HTTP_HITL_CLASSIFICATION_ENABLED_KEY: &str = "http_hitl_classification_enabled";
 
-/// Default-off bounded HTTP waiting, currently NO RELEASE.
+/// Default-off bounded HTTP waiting for the limited-MVP human approval flow.
 ///
-/// This preserves an eligible client request until cancellation/expiry; it does not create an
-/// approval proposal or forward it, even after a policy reload or approval.
+/// When enabled, eligible bodyless HTTP/1.1 REST requests may be frozen, submitted for
+/// review, and resumed only after fresh native L4/L7 policy reauthorization and a new
+/// upstream connection. This remains intentionally limited to the current reviewed MVP
+/// boundary and does not grant unrestricted production or current-executor continuity.
 pub const HTTP_HITL_WAIT_ENABLED_KEY: &str = "http_hitl_wait_enabled";
+
+/// Maximum hold time, in seconds, for a single reviewed HTTP request before the
+/// wait ends with a terminal timeout. Values above 300 are rejected by the runtime.
+pub const HTTP_HITL_WAIT_TIMEOUT_SECONDS_KEY: &str = "http_hitl_wait_timeout_seconds";
+
+/// Maximum number of active HTTP HITL waiters allowed in one sandbox. Values above
+/// 16 are rejected by the runtime; operators may tighten this below the current default.
+pub const HTTP_HITL_WAIT_SANDBOX_LIMIT_KEY: &str = "http_hitl_wait_sandbox_limit";
+
+/// Maximum number of active HTTP HITL waiters allowed for one destination bucket.
+/// Values above 4 are rejected by the runtime; operators may tighten this below the
+/// current default while retaining the conservative per-destination charge.
+pub const HTTP_HITL_WAIT_DESTINATION_LIMIT_KEY: &str = "http_hitl_wait_destination_limit";
 
 /// Approval mode for agent-authored policy proposals.
 ///
@@ -158,6 +173,21 @@ pub const REGISTERED_SETTINGS: &[RegisteredSetting] = &[
         kind: SettingValueKind::Bool,
         allowed_string_values: None,
     },
+    RegisteredSetting {
+        key: HTTP_HITL_WAIT_TIMEOUT_SECONDS_KEY,
+        kind: SettingValueKind::Int,
+        allowed_string_values: None,
+    },
+    RegisteredSetting {
+        key: HTTP_HITL_WAIT_SANDBOX_LIMIT_KEY,
+        kind: SettingValueKind::Int,
+        allowed_string_values: None,
+    },
+    RegisteredSetting {
+        key: HTTP_HITL_WAIT_DESTINATION_LIMIT_KEY,
+        kind: SettingValueKind::Int,
+        allowed_string_values: None,
+    },
     // Approval mode for agent-authored proposals. See
     // PROPOSAL_APPROVAL_MODE_KEY for details. Defaults to manual.
     RegisteredSetting {
@@ -219,6 +249,19 @@ mod tests {
         assert_eq!(setting.kind, SettingValueKind::Bool);
         assert_ne!(setting.key, super::HTTP_HITL_CLASSIFICATION_ENABLED_KEY);
         assert!(setting.allowed_string_values.is_none());
+    }
+
+    #[test]
+    fn http_hitl_wait_limits_are_registered_integer_settings() {
+        for key in [
+            super::HTTP_HITL_WAIT_TIMEOUT_SECONDS_KEY,
+            super::HTTP_HITL_WAIT_SANDBOX_LIMIT_KEY,
+            super::HTTP_HITL_WAIT_DESTINATION_LIMIT_KEY,
+        ] {
+            let setting = setting_for_key(key).unwrap();
+            assert_eq!(setting.kind, SettingValueKind::Int);
+            assert!(setting.allowed_string_values.is_none());
+        }
     }
 
     #[test]

@@ -29,8 +29,9 @@ use std::sync::{
     Arc, Mutex, RwLock,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
+use std::time::Duration;
 use tokio::sync::watch;
-use tracing::info;
+use tracing::{info, warn};
 
 mod raw_schema;
 
@@ -341,6 +342,28 @@ impl OpaEngine {
     /// Opt in only to bounded no-release waiting, never approval or forwarding.
     pub fn set_http_hitl_wait_enabled(&self, enabled: bool) {
         self.http_hitl_wait.configure(enabled);
+    }
+
+    /// Tighten wait limits while preserving the hard safety cap. Values above the
+    /// runtime's system maximum are rejected instead of widening the reservation.
+    pub fn set_http_hitl_wait_limits(
+        &self,
+        budget: Duration,
+        sandbox_limit: usize,
+        destination_limit: usize,
+    ) {
+        if let Err(error) = self
+            .http_hitl_wait
+            .configure_limits(budget, sandbox_limit, destination_limit)
+        {
+            warn!(
+                ?budget,
+                sandbox_limit,
+                destination_limit,
+                error = %error,
+                "Rejecting invalid HTTP HITL wait limits; keeping safety cap"
+            );
+        }
     }
 
     pub fn http_hitl_wait_enabled(&self) -> bool {

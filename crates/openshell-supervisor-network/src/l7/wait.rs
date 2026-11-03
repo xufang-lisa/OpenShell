@@ -31,6 +31,25 @@ pub enum WaitEnd {
     CurrentExecutorUnavailable,
 }
 
+impl WaitEnd {
+    #[must_use]
+    pub fn reason_code(self) -> &'static str {
+        match self {
+            Self::Deadline => "approval_timeout",
+            Self::ClientClosed => "client_closed",
+            Self::ExtraInput => "extra_input",
+            Self::ClientError => "client_error",
+            Self::Disabled => "approval_disabled",
+            Self::Quarantined => "approval_quarantined",
+            Self::Shutdown => "approval_shutdown",
+            Self::ProposalUnavailable => "approval_unavailable",
+            Self::ProposalRejected => "approval_rejected",
+            Self::PolicyChanged => "policy_changed",
+            Self::CurrentExecutorUnavailable => "current_executor_unavailable",
+        }
+    }
+}
+
 struct Population {
     enabled: bool,
     quarantined: bool,
@@ -540,6 +559,15 @@ mod tests {
             .count();
         assert_eq!(admitted, 4);
         assert_eq!(runtime.population(), 0);
+    }
+
+    #[test]
+    fn wait_end_exposes_stable_machine_readable_reasons() {
+        assert_eq!(WaitEnd::Deadline.reason_code(), "approval_timeout");
+        assert_eq!(WaitEnd::ProposalRejected.reason_code(), "approval_rejected");
+        assert_eq!(WaitEnd::ProposalUnavailable.reason_code(), "approval_unavailable");
+        assert_eq!(WaitEnd::Disabled.reason_code(), "approval_disabled");
+        assert_eq!(WaitEnd::CurrentExecutorUnavailable.reason_code(), "current_executor_unavailable");
     }
 
     #[tokio::test(start_paused = true)]

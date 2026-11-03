@@ -608,6 +608,7 @@ impl<C: tokio::io::AsyncRead> HttpSession<C> {
             return Some(outcome);
         };
         let (host, port) = waiter.destination();
+        let reason_code = reason.reason_code();
         ocsf_emit!(
             NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
                 .activity(ActivityId::Other)
@@ -615,11 +616,14 @@ impl<C: tokio::io::AsyncRead> HttpSession<C> {
                 .dst_endpoint(Endpoint::from_domain(host, port))
                 .unmapped("request_id", serde_json::json!(self.slot.review_request_id))
                 .unmapped("chunk_id", serde_json::json!(self.slot.submitted_proposal))
+                .unmapped("reason_code", serde_json::json!(reason_code))
                 .unmapped(
                     "completed_observations",
                     serde_json::json!(completed_observations)
                 )
-                .message(format!("HTTP_HITL_WAIT terminal={reason:?}; no release"))
+                .message(format!(
+                    "HTTP_HITL_WAIT terminal={reason_code} ({reason:?}); no release"
+                ))
                 .build()
         );
         self.slot.terminate();

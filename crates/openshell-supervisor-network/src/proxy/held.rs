@@ -48,14 +48,20 @@ pub(super) async fn resume_after_review<C>(
 where
     C: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    let Some(ReviewWaitOutcome::Covered { generation }) = session.wait_for_approval().await else {
-        return Ok(());
-    };
-    let result = resume_once(session, environment, tls, generation).await;
-    // At most one attempt, even if a connect, write, response or flush failed.
-    // No persistent decision can reconstruct this transport or revive Q.
-    session.parts().1.terminate();
-    result
+    match session.wait_for_approval().await {
+        Some(ReviewWaitOutcome::Covered { generation }) => {
+            let result = resume_once(session, environment, tls, generation).await;
+            // At most one attempt, even if a connect, write, response or flush failed.
+            // No persistent decision can reconstruct this transport or revive Q.
+            session.parts().1.terminate();
+            result
+        }
+        Some(ReviewWaitOutcome::Terminal(reason)) => Err(miette::miette!(
+            "held review ended before fresh admission: reason={} ({reason:?})",
+            reason.reason_code()
+        )),
+        None => Ok(()),
+    }
 }
 
 async fn resume_once<C>(

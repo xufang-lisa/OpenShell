@@ -220,6 +220,51 @@ pub(crate) fn native_literal_request(method: &str, path: &str) -> bool {
         .is_ok_and(|(canonical, query)| canonical.path == path && query.is_none())
 }
 
+/// Project authored constraints without losing gateway-derived provenance.
+fn project_runtime_rule(
+    mut rule: serde_json::Value,
+    policy_name: &str,
+) -> Option<NetworkPolicyRule> {
+    let endpoints = rule.get_mut("endpoints")?.as_array_mut()?;
+    let mut provenance = Vec::with_capacity(endpoints.len());
+    for endpoint in endpoints.iter_mut() {
+        let object = endpoint.as_object_mut()?;
+        object.remove("policy_hash");
+        object.remove("endpoint_id");
+        // Informational proto-only marker, not an authorization constraint.
+        object.remove("advisor_proposed");
+        // Gateway-derived authorization provenance is not authored syntax.
+        // Save it from this generation-pinned clone and restore it on the
+        // matching proto endpoint; never remove it from the live evaluator.
+        let credentialed = match object.remove("provider_credentialed") {
+            None => false,
+            Some(serde_json::Value::Bool(value)) => value,
+            Some(_) => return None,
+        };
+        let owner = match object.remove("token_grant_owner") {
+            None => String::new(),
+            Some(serde_json::Value::String(value)) => value,
+            Some(_) => return None,
+        };
+        provenance.push((credentialed, owner));
+    }
+    let mut document = serde_json::json!({"version": 1, "network_policies": {}});
+    document["network_policies"][policy_name] = rule;
+    let mut policy: SandboxPolicy =
+        openshell_policy::parse_sandbox_policy(&document.to_string()).ok()?;
+    let mut scope = policy.network_policies.remove(policy_name)?;
+    // Authored parsing preserves endpoint order. Restore before filtering so
+    // an unrelated endpoint's owner cannot be rebound to the held destination.
+    if scope.endpoints.len() != provenance.len() {
+        return None;
+    }
+    for (endpoint, (credentialed, owner)) in scope.endpoints.iter_mut().zip(provenance) {
+        endpoint.provider_credentialed = credentialed;
+        endpoint.token_grant_owner = owner;
+    }
+    Some(scope)
+}
+
 /// Extract only after classification has been bound to this exact frozen Q.
 /// Fail closed rather than guess wildcard scopes, ambiguous route templates,
 /// untrusted argv identities, or unsupported authored-policy projections.
@@ -279,23 +324,11 @@ pub(crate) fn extract(
         }
         serde_json::to_value(opa.get_data()).ok()?
     };
-    let mut rule = value
+    let rule = value
         .get("network_policies")?
         .get(&ctx.policy_name)?
         .clone();
-    let endpoints = rule.get_mut("endpoints")?.as_array_mut()?;
-    for endpoint in endpoints.iter_mut() {
-        let object = endpoint.as_object_mut()?;
-        object.remove("policy_hash");
-        object.remove("endpoint_id");
-        // Informational proto-only marker, not an authorization constraint.
-        object.remove("advisor_proposed");
-    }
-    let mut document = serde_json::json!({"version": 1, "network_policies": {}});
-    document["network_policies"][&ctx.policy_name] = rule;
-    let mut policy: SandboxPolicy =
-        openshell_policy::parse_sandbox_policy(&document.to_string()).ok()?;
-    let mut scope = policy.network_policies.remove(&ctx.policy_name)?;
+    let mut scope = project_runtime_rule(rule, &ctx.policy_name)?;
     scope.binaries.retain(|binary| {
         literal_binary(&binary.path)
             && (binary.path == ctx.binary_path || ctx.ancestors.contains(&binary.path))

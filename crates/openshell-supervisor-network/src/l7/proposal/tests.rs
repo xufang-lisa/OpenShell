@@ -391,3 +391,179 @@ async fn http_hitl_disconnect_and_extra_input_cancel_stalled_submission() {
         );
     }
 }
+
+fn provider_projection_fixture(credentialed: bool) -> SandboxPolicy {
+    let mut policy = openshell_policy::parse_sandbox_policy(
+        r#"
+version: 1
+network_policies:
+  _provider_oc_company:
+    endpoints:
+      - host: 10.239.168.89
+        port: 11434
+        path: /v3/**
+        protocol: rest
+        enforcement: enforce
+        allowed_ips: [10.239.168.89/32]
+        rules:
+          - allow: {method: POST, path: /v3/chat/completions}
+        deny_rules:
+          - {method: DELETE, path: /v3/blocked}
+    binaries:
+      - {path: /usr/local/bin/node}
+"#,
+    )
+    .unwrap();
+    let rule = policy
+        .network_policies
+        .get_mut("_provider_oc_company")
+        .unwrap();
+    let endpoint = &mut rule.endpoints[0];
+    endpoint.provider_credentialed = credentialed;
+    endpoint.tls = openshell_core::proto::NetworkTlsMode::Skip as i32;
+    endpoint.credential_binding = Some(openshell_core::proto::NetworkCredentialBinding {
+        provider: "synthetic-provider".into(),
+    });
+    endpoint.request_body_credential_rewrite = true;
+    endpoint.allow_encoded_slash = true;
+    let mut unrelated = endpoint.clone();
+    unrelated.host = "other.example.test".into();
+    unrelated.provider_credentialed = !credentialed;
+    // Keep the held destination second to catch reattaching provenance only
+    // after filtering, which would bind the first endpoint's owner instead.
+    rule.endpoints.insert(0, unrelated);
+    let owners = openshell_core::policy_identity::provider_token_grant_owners(
+        "synthetic-provider-record",
+        rule,
+    );
+    assert_eq!(owners.len(), rule.endpoints.len());
+    for (endpoint, owner) in rule.endpoints.iter_mut().zip(owners) {
+        endpoint.token_grant_owner = owner;
+    }
+    policy
+}
+
+#[test]
+fn http_hitl_provider_projection_preserves_constraints_and_enters_wait() {
+    // In-process only: no sockets, Gateway, upstream calls or approvals.
+    for credentialed in [false, true] {
+        let policy = provider_projection_fixture(credentialed);
+        let mut expected = policy.network_policies["_provider_oc_company"].endpoints[1].clone();
+        expected.rules.clear();
+        expected.access = 0;
+        expected.advisor_proposed = true;
+        let engine = OpaEngine::from_proto(&policy).unwrap();
+        engine.set_http_hitl_wait_enabled(true);
+        let service = Arc::new(Service {
+            calls: AtomicUsize::new(0),
+            mode: 0,
+        });
+        engine.set_http_hitl_proposal_service(service.clone());
+        let tunnel = engine.clone_engine_for_tunnel(0).unwrap();
+        let data_before = {
+            let opa = tunnel.engine().lock().unwrap();
+            serde_json::to_value(opa.get_data()).unwrap()
+        };
+        let endpoint = serde_json::from_value(
+            data_before["network_policies"]["_provider_oc_company"]["endpoints"][1].clone(),
+        )
+        .unwrap();
+        let config = crate::l7::parse_l7_config(&endpoint).unwrap();
+        let ctx = L7EvalContext {
+            host: "10.239.168.89".into(),
+            port: 11434,
+            request_default_port: Some(80),
+            workspace: "default".into(),
+            policy_name: "_provider_oc_company".into(),
+            binary_path: "/usr/local/bin/node".into(),
+            ..Default::default()
+        };
+        let request = crate::l7::rest::request_from_buffered_http(
+            "GET",
+            "/v3/models",
+            "/v3/models?probe=query-sentinel",
+            b"GET /v3/models?probe=query-sentinel HTTP/1.1\r\nHost: 10.239.168.89:11434\r\nConnection: keep-alive\r\n\r\n".to_vec(),
+        )
+        .unwrap();
+        let info = L7RequestInfo {
+            action: request.action.clone(),
+            target: request.target.clone(),
+            query_params: request.query_params.clone(),
+            graphql: None,
+            jsonrpc: None,
+        };
+        let mut slot = RequestSlot::new();
+        slot.enable_wait_admission();
+        slot.freeze(request.clone(), 0).unwrap();
+        assert!(
+            !hitl::evaluate_http_l7_request_with_slot(
+                &tunnel, &ctx, &config, &request, &info, &mut slot,
+            )
+            .unwrap()
+            .0
+        );
+        assert_eq!(
+            slot.classification(tunnel.generation_guard())
+                .unwrap()
+                .eligibility,
+            hitl::RestHitlEligibility::EligibleForReview
+        );
+        let input = extract(&tunnel, &ctx, &config, slot.frozen().unwrap()).unwrap();
+        assert_eq!(input.scope().endpoints, vec![expected.clone()]);
+        assert_eq!(
+            input.scope().binaries,
+            policy.network_policies["_provider_oc_company"].binaries
+        );
+        assert_eq!(input.path(), "/v3/models");
+        assert_eq!(slot.held_input().unwrap().scope(), input.scope());
+        for excluded in ["query-sentinel", expected.token_grant_owner.as_str()] {
+            assert!(!input.review_metadata().contains(excluded));
+        }
+        let data_after = {
+            let opa = tunnel.engine().lock().unwrap();
+            serde_json::to_value(opa.get_data()).unwrap()
+        };
+        assert_eq!(data_before, data_after);
+        assert!(slot.try_begin_wait(&tunnel, &ctx.host, ctx.port));
+        assert_eq!(engine.http_hitl_wait_runtime().population(), 1);
+        assert_eq!(service.calls.load(Ordering::SeqCst), 0);
+        drop(slot);
+        assert_eq!(engine.http_hitl_wait_runtime().population(), 0);
+    }
+}
+
+#[test]
+fn http_hitl_provider_projection_rejects_invalid_or_unknown_metadata() {
+    let policy = provider_projection_fixture(false);
+    let engine = OpaEngine::from_proto(&policy).unwrap();
+    let tunnel = engine.clone_engine_for_tunnel(0).unwrap();
+    let data = {
+        let opa = tunnel.engine().lock().unwrap();
+        serde_json::to_value(opa.get_data()).unwrap()
+    };
+    let source = &data["network_policies"]["_provider_oc_company"];
+    // L7 loading already checks types; detached clones also verify that the
+    // projection boundary never silently drops malformed or unknown fields.
+    for (field, value) in [
+        ("provider_credentialed", serde_json::json!("not-a-boolean")),
+        ("provider_credentialed", serde_json::Value::Null),
+        ("token_grant_owner", serde_json::json!(true)),
+        ("token_grant_owner", serde_json::Value::Null),
+        ("unsupported_runtime_marker", serde_json::json!(true)),
+    ] {
+        let mut rule = source.clone();
+        rule["endpoints"][1][field] = value;
+        assert!(project_runtime_rule(rule, "_provider_oc_company").is_none());
+    }
+    let mut defaults = source.clone();
+    for endpoint in defaults["endpoints"].as_array_mut().unwrap() {
+        let object = endpoint.as_object_mut().unwrap();
+        object.remove("provider_credentialed");
+        object.remove("token_grant_owner");
+    }
+    let scope = project_runtime_rule(defaults, "_provider_oc_company").unwrap();
+    assert!(scope.endpoints.iter().all(|endpoint| {
+        !endpoint.provider_credentialed && endpoint.token_grant_owner.is_empty()
+    }));
+    assert_eq!(engine.http_hitl_wait_runtime().population(), 0);
+}
